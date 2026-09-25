@@ -1404,6 +1404,86 @@ impl GraphicsPipelineServer {
         Some(frame_id)
     }
 
+    /// Queue an H.264 AVC444v2 frame (MS-RDPEGFX 2.2.4.6) for transmission
+    ///
+    /// `luma` is the YUV420 (main) view and `chroma` the Chroma420 (auxiliary) view of the
+    /// YUV444v2 layout, each an H.264 bitstream with its regions. Either may be left out: the
+    /// client shows the regions of a luma-only frame in 4:2:0 and combines a chroma-only frame
+    /// with the luma it decoded last. Both views belong to one H.264 stream, from one encoder.
+    ///
+    /// Returns `Some(frame_id)` if queued, `None` if not supported, backpressured, or given
+    /// neither view.
+    pub fn send_avc444v2_frame(
+        &mut self,
+        surface_id: u16,
+        luma: Option<(&[u8], &[Avc420Region])>,
+        chroma: Option<(&[u8], &[Avc420Region])>,
+        timestamp_ms: u32,
+    ) -> Option<u32> {
+        if !self.is_ready() {
+            return None;
+        }
+        if !self.supports_avc444() {
+            return None;
+        }
+        if self.should_backpressure() {
+            self.qoe.record_backpressure();
+            return None;
+        }
+
+        let surface = self.surfaces.get(surface_id)?;
+
+        let (avc444_stream, regions) = match (luma, chroma) {
+            (Some(luma), Some(chroma)) => (
+                Avc444BitmapStream {
+                    encoding: Encoding::LUMA_AND_CHROMA,
+                    stream1: avc420_view(luma),
+                    stream2: Some(avc420_view(chroma)),
+                },
+                luma.1,
+            ),
+            (Some(luma), None) => (
+                Avc444BitmapStream {
+                    encoding: Encoding::LUMA,
+                    stream1: avc420_view(luma),
+                    stream2: None,
+                },
+                luma.1,
+            ),
+            (None, Some(chroma)) => (
+                Avc444BitmapStream {
+                    encoding: Encoding::CHROMA,
+                    stream1: avc420_view(chroma),
+                    stream2: None,
+                },
+                chroma.1,
+            ),
+            (None, None) => return None,
+        };
+
+        let encoded_stream = encode_avc444_bitmap_stream(&avc444_stream);
+        let target_rect = Self::compute_dest_rect(regions, surface.width, surface.height);
+        let pixel_format = surface.pixel_format;
+
+        let timestamp = Self::make_timestamp(timestamp_ms);
+        let frame_id = self.frames.begin_frame(timestamp);
+
+        self.output_queue
+            .push_back(GfxPdu::StartFrame(StartFramePdu { timestamp, frame_id }));
+
+        self.output_queue.push_back(GfxPdu::WireToSurface1(WireToSurface1Pdu {
+            surface_id,
+            codec_id: Codec1Type::Avc444v2,
+            pixel_format,
+            destination_rectangle: target_rect,
+            bitmap_data: encoded_stream,
+        }));
+
+        self.output_queue.push_back(GfxPdu::EndFrame(EndFramePdu { frame_id }));
+
+        Some(frame_id)
+    }
+
     /// Queue an uncompressed bitmap frame for transmission via EGFX
     ///
     /// Sends raw pixel data through `WireToSurface1` with `Codec1Type::Uncompressed`.
@@ -1766,6 +1846,15 @@ impl DvcServerProcessor for GraphicsPipelineServer {}
 // ============================================================================
 // AVC444 Encoding Helper
 // ============================================================================
+
+/// One view of an AVC444 frame: an H.264 bitstream and the regions it updates.
+fn avc420_view<'a>((data, regions): (&'a [u8], &[Avc420Region])) -> Avc420BitmapStream<'a> {
+    Avc420BitmapStream {
+        rectangles: regions.iter().map(Avc420Region::to_rectangle).collect(),
+        quant_qual_vals: regions.iter().map(Avc420Region::to_quant_quality).collect(),
+        data,
+    }
+}
 
 /// Encode an AVC444 bitmap stream to bytes
 fn encode_avc444_bitmap_stream(stream: &Avc444BitmapStream<'_>) -> Vec<u8> {

@@ -440,7 +440,9 @@ fn from_buffer_consume_correctly_parses_avc_444_message() {
 #[test]
 fn to_buffer_consume_correctly_serializes_avc_444_message() {
     let buffer = encode_vec(&*AVC_444_BITMAP).unwrap();
-    let expected = AVC_444_MESSAGE_CORRECT_LEN.as_ref();
+    // A chroma-only stream carries no luma frame, so its luma size is zero (MS-RDPEGFX 2.2.4.5),
+    // as in the message captured from a Windows server.
+    let expected = AVC_444_MESSAGE_INCORRECT_LEN.as_ref();
 
     assert_eq!(expected, buffer.as_slice());
 }

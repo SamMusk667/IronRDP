@@ -198,8 +198,15 @@ impl Encode for Avc444BitmapStream<'_> {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_fixed_part_size!(in: dst);
 
+        // The size is that of the YUV420 (luma) frame, which a chroma-only stream does not carry:
+        // MS-RDPEGFX 2.2.4.5 and 2.2.4.6 want zero then, as Windows servers send it.
+        let luma_size = if self.encoding == Encoding::CHROMA {
+            0
+        } else {
+            cast_length!("stream1size", self.stream1.size())?
+        };
         let mut stream_info = 0u32;
-        stream_info.set_bits(0..30, cast_length!("stream1size", self.stream1.size())?);
+        stream_info.set_bits(0..30, luma_size);
         stream_info.set_bits(30..32, self.encoding.bits().into());
         dst.write_u32(stream_info);
         self.stream1.encode(dst)?;

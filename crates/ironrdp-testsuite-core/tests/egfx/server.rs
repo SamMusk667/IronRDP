@@ -426,3 +426,49 @@ fn test_send_uncompressed_frame_backpressure() {
     let frame2 = server.send_uncompressed_frame(surface_id, &pixel_data, 64, 64, 16);
     assert!(frame2.is_none());
 }
+
+#[test]
+fn test_send_avc444v2_frame_queues_luma_chroma_or_both() {
+    let handler = Box::new(TestHandler::new());
+    let mut server = GraphicsPipelineServer::new(handler);
+
+    let client_caps_pdu = GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(&[CapabilitySet::V10 {
+        flags: CapabilitiesV10Flags::SMALL_CACHE,
+    }]));
+    let payload = encode_pdu(&client_caps_pdu);
+    let _output = server.process(0, &payload).expect("process failed");
+
+    let surface_id = server.create_surface(64, 64).unwrap();
+    server.map_surface_to_output(surface_id, 0, 0);
+    server.drain_output();
+
+    let h264_data = vec![0x00, 0x00, 0x00, 0x01, 0x67];
+    let regions = vec![Avc420Region::full_frame(64, 64, 22)];
+    let view = Some((h264_data.as_slice(), regions.as_slice()));
+
+    assert!(server.send_avc444v2_frame(surface_id, view, None, 0).is_some(), "luma only");
+    assert_eq!(server.drain_output().len(), 3);
+    assert!(server.send_avc444v2_frame(surface_id, None, view, 16).is_some(), "chroma only");
+    assert_eq!(server.drain_output().len(), 3);
+    assert!(server.send_avc444v2_frame(surface_id, view, view, 33).is_some(), "both");
+    assert_eq!(server.drain_output().len(), 3);
+    assert!(server.send_avc444v2_frame(surface_id, None, None, 50).is_none(), "neither");
+}
+
+#[test]
+fn test_send_avc444v2_frame_needs_avc444() {
+    let handler = Box::new(TestHandler::new());
+    let mut server = GraphicsPipelineServer::new(handler);
+
+    let client_caps_pdu = GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(&[CapabilitySet::V8_1 {
+        flags: CapabilitiesV81Flags::AVC420_ENABLED,
+    }]));
+    let payload = encode_pdu(&client_caps_pdu);
+    let _output = server.process(0, &payload).expect("process failed");
+
+    let surface_id = server.create_surface(64, 64).unwrap();
+    let h264_data = vec![0x00, 0x00, 0x00, 0x01, 0x67];
+    let regions = vec![Avc420Region::full_frame(64, 64, 22)];
+    let view = Some((h264_data.as_slice(), regions.as_slice()));
+    assert!(server.send_avc444v2_frame(surface_id, view, None, 0).is_none());
+}
