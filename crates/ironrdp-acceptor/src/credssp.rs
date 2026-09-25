@@ -1,3 +1,5 @@
+use core::fmt;
+
 use ironrdp_async::NetworkClient;
 use ironrdp_connector::sspi::credssp::{
     CredSspServer, CredentialsProxy, ServerError, ServerMode, ServerState, TsRequest,
@@ -38,8 +40,9 @@ pub type CredsspProcessGenerator<'a> =
 
 #[derive(Debug)]
 pub struct CredsspSequence<'a> {
-    server: CredSspServer<CredentialsProxyImpl<'a>>,
+    server: CredSspServer<Verifier<'a>>,
     state: CredsspState,
+    delegated: Option<AuthIdentity>,
 }
 
 #[derive(Debug)]
@@ -69,6 +72,46 @@ impl CredentialsProxy for CredentialsProxyImpl<'_> {
 
     fn auth_data(&mut self) -> Result<Vec<Self::AuthenticationData>, std::io::Error> {
         Ok(vec![self.credentials.clone()])
+    }
+}
+
+/// The credentials a [`CredsspSequence`] verifies the client against.
+enum Verifier<'a> {
+    Single(CredentialsProxyImpl<'a>),
+    Lookup(&'a mut (dyn CredentialsProxy<AuthenticationData = AuthIdentity> + Send)),
+}
+
+impl fmt::Debug for Verifier<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Single(single) => single.fmt(f),
+            Self::Lookup(_) => f.write_str("Lookup"),
+        }
+    }
+}
+
+impl CredentialsProxy for Verifier<'_> {
+    type AuthenticationData = AuthIdentity;
+
+    fn auth_data_by_user(&mut self, username: &Username) -> std::io::Result<Self::AuthenticationData> {
+        match self {
+            Self::Single(single) => single.auth_data_by_user(username),
+            Self::Lookup(lookup) => lookup.auth_data_by_user(username),
+        }
+    }
+
+    fn auth_data_candidates_by_user(&mut self, username: &Username) -> std::io::Result<Vec<Self::AuthenticationData>> {
+        match self {
+            Self::Single(single) => single.auth_data_candidates_by_user(username),
+            Self::Lookup(lookup) => lookup.auth_data_candidates_by_user(username),
+        }
+    }
+
+    fn auth_data(&mut self) -> Result<Vec<Self::AuthenticationData>, std::io::Error> {
+        match self {
+            Self::Single(single) => single.auth_data(),
+            Self::Lookup(lookup) => lookup.auth_data(),
+        }
     }
 }
 
@@ -107,8 +150,31 @@ impl<'a> CredsspSequence<'a> {
         public_key: Vec<u8>,
         krb_config: Option<KerberosServerConfig>,
     ) -> ConnectorResult<Self> {
+        let credentials = Verifier::Single(CredentialsProxyImpl::new(creds));
+        Self::start(credentials, client_computer_name, public_key, krb_config)
+    }
+
+    /// Like [`Self::init`], but verifies the client against the credentials `lookup` returns for
+    /// the name the client authenticates as, so that more than one account can log on.
+    ///
+    /// NTLM needs an account's secret before the client delegates anything, so the lookup has to
+    /// return it: the password, or the NT hash in the [`sspi::NTLM_HASH_PREFIX`] form.
+    pub fn init_with_lookup(
+        lookup: &'a mut (dyn CredentialsProxy<AuthenticationData = AuthIdentity> + Send),
+        client_computer_name: ServerName,
+        public_key: Vec<u8>,
+        krb_config: Option<KerberosServerConfig>,
+    ) -> ConnectorResult<Self> {
+        Self::start(Verifier::Lookup(lookup), client_computer_name, public_key, krb_config)
+    }
+
+    fn start(
+        credentials: Verifier<'a>,
+        client_computer_name: ServerName,
+        public_key: Vec<u8>,
+        krb_config: Option<KerberosServerConfig>,
+    ) -> ConnectorResult<Self> {
         let client_computer_name = client_computer_name.into_inner();
-        let credentials = CredentialsProxyImpl::new(creds);
 
         let server_mode = if let Some(krb_config) = krb_config {
             ServerMode::Negotiate(NegotiateConfig {
@@ -126,6 +192,7 @@ impl<'a> CredsspSequence<'a> {
         let sequence = Self {
             server,
             state: CredsspState::Ongoing,
+            delegated: None,
         };
 
         Ok(sequence)
@@ -149,6 +216,11 @@ impl<'a> CredsspSequence<'a> {
         self.server.process(request)
     }
 
+    /// Takes the credentials the client delegated at the end of the exchange.
+    pub fn take_delegated_credentials(&mut self) -> Option<AuthIdentity> {
+        self.delegated.take()
+    }
+
     pub fn handle_process_result(
         &mut self,
         result: Result<ServerState, ServerError>,
@@ -156,7 +228,10 @@ impl<'a> CredsspSequence<'a> {
     ) -> ConnectorResult<Written> {
         let (ts_request, next_state) = match result {
             Ok(ServerState::ReplyNeeded(ts_request)) => (Some(ts_request), CredsspState::Ongoing),
-            Ok(ServerState::Finished(_id)) => (None, CredsspState::Finished),
+            Ok(ServerState::Finished(identity)) => {
+                self.delegated = Some(identity);
+                (None, CredsspState::Finished)
+            }
             Err(err) => (
                 err.ts_request.map(|ts_request| *ts_request),
                 CredsspState::ServerError(err.error),

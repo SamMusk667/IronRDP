@@ -36,7 +36,7 @@ pub struct Acceptor {
     static_channels: StaticChannelSet,
     saved_for_reactivation: AcceptorState,
     pub(crate) creds: Option<Credentials>,
-    received_credentials: Option<Credentials>,
+    pub(crate) received_credentials: Option<Credentials>,
     reactivation: bool,
     honor_client_desktop_size: bool,
 }
@@ -96,11 +96,12 @@ pub struct AcceptorResult {
     /// announce one. Servers can use it to pick a server-side keyboard layout
     /// matching the client without changing any local input state.
     pub keyboard_layout: u32,
-    /// Credentials received from the client during SecureSettingsExchange.
+    /// Credentials received from the client.
     ///
-    /// Present for TLS-mode connections where the client sends credentials
-    /// in the ClientInfoPdu. `None` for CredSSP/Hybrid connections (where
-    /// authentication happens during the CredSSP exchange instead).
+    /// For TLS-mode connections, the credentials the client sends in the
+    /// ClientInfoPdu during SecureSettingsExchange. For CredSSP/Hybrid
+    /// connections, the credentials the client delegated at the end of the
+    /// CredSSP exchange, after authentication already succeeded.
     ///
     /// Servers that need to validate credentials (e.g., via PAM or LDAP)
     /// can use this field for post-handshake validation.

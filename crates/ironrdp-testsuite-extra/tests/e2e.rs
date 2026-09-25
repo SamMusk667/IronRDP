@@ -5,15 +5,18 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use ironrdp::connector;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::echo::client::EchoClient;
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp::pdu::{self, gcc};
+use ironrdp::server::sspi::credssp::CredentialsProxy;
+use ironrdp::server::sspi::{AuthIdentity, Username};
 use ironrdp::server::{
-    self, DesktopSize, DisplayUpdate, KeyboardEvent, MouseEvent, PixelFormat, RdpServer, RdpServerDisplay,
-    RdpServerDisplayUpdates, RdpServerInputHandler, ServerEvent, TlsIdentityCtx,
+    self, CredentialDecision, CredentialValidationError, CredentialValidator, DesktopSize, DisplayUpdate,
+    KeyboardEvent, MouseEvent, PixelFormat, RdpServer, RdpServerDisplay, RdpServerDisplayUpdates,
+    RdpServerInputHandler, ServerEvent, TlsIdentityCtx,
 };
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{self, ActiveStage, ActiveStageBuilder, ActiveStageOutput};
@@ -427,4 +430,160 @@ fn default_client_config() -> connector::Config {
         alternate_shell: String::new(),
         work_dir: String::new(),
     }
+}
+
+/// The account [`NlaAccounts`] knows, with NTOWFv1("Password") from [MS-NLMP] 4.2.2.1.2.
+const NLA_USERNAME: &str = "User";
+const NLA_PASSWORD: &str = "Password";
+const NLA_NT_HASH: &str = "$NTLM$:a4f49c406510bdcab6824ee7c30fd852";
+
+#[tokio::test]
+async fn test_hybrid_lookup_accepts_an_account_and_validates_its_delegated_credentials() {
+    let delegated = hybrid_connect(NLA_USERNAME, NLA_PASSWORD)
+        .await
+        .expect("connection accepted");
+    assert!(
+        delegated
+            == server::Credentials {
+                username: NLA_USERNAME.into(),
+                password: NLA_PASSWORD.into(),
+                domain: None,
+            }
+    );
+}
+
+#[tokio::test]
+async fn test_hybrid_lookup_rejects_a_wrong_password() {
+    assert!(hybrid_connect(NLA_USERNAME, "wrong").await.is_err());
+}
+
+#[tokio::test]
+async fn test_hybrid_lookup_rejects_an_unknown_account() {
+    assert!(hybrid_connect("Nobody", NLA_PASSWORD).await.is_err());
+}
+
+/// One account, stored as its NT hash.
+struct NlaAccounts;
+
+impl CredentialsProxy for NlaAccounts {
+    type AuthenticationData = AuthIdentity;
+
+    fn auth_data_by_user(&mut self, username: &Username) -> std::io::Result<AuthIdentity> {
+        if username.account_name() != NLA_USERNAME {
+            return Err(std::io::Error::other("unknown account"));
+        }
+        Ok(AuthIdentity {
+            username: username.clone(),
+            password: NLA_NT_HASH.to_owned().into(),
+        })
+    }
+
+    fn auth_data(&mut self) -> std::io::Result<Vec<AuthIdentity>> {
+        Ok(Vec::new())
+    }
+}
+
+struct StopAfterOneConnection;
+
+impl server::ConnectionHandler for StopAfterOneConnection {
+    fn on_disconnected(
+        &mut self,
+        _: core::net::SocketAddr,
+        _: Duration,
+        _: Option<&anyhow::Error>,
+    ) -> server::PostConnectionAction {
+        server::PostConnectionAction::Stop
+    }
+}
+
+/// Accepts any credentials and hands the first ones over.
+struct DelegatedCredentials(std::sync::Mutex<Option<oneshot::Sender<server::Credentials>>>);
+
+#[async_trait::async_trait]
+impl CredentialValidator for DelegatedCredentials {
+    async fn validate(
+        &self,
+        credentials: &server::Credentials,
+    ) -> Result<CredentialDecision, CredentialValidationError> {
+        if let Some(tx) = self.0.lock().unwrap().take() {
+            let _ = tx.send(credentials.clone());
+        }
+        Ok(CredentialDecision::Accept)
+    }
+}
+
+/// Connects to a Hybrid server that verifies clients against [`NlaAccounts`], and returns the
+/// credentials the client delegated once the server validates them.
+async fn hybrid_connect(username: &str, password: &str) -> Result<server::Credentials> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    let cert_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-cert.pem");
+    let key_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-key.pem");
+    let identity = TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("failed to init TLS identity");
+    let acceptor = identity.make_acceptor().expect("failed to build TLS acceptor");
+
+    let (_display_tx, display_rx) = mpsc::unbounded_channel();
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_hybrid(acceptor, identity.pub_key.clone())
+        .with_input_handler(TestInputHandler)
+        .with_display_handler(TestDisplay {
+            rx: Arc::new(Mutex::new(display_rx)),
+        })
+        .with_connection_handler(Some(Box::new(StopAfterOneConnection)))
+        .build();
+    server.set_credentials_lookup(Some(Box::new(NlaAccounts)));
+    let (delegated_tx, delegated_rx) = oneshot::channel();
+    server.set_credential_validator(Some(Arc::new(DelegatedCredentials(std::sync::Mutex::new(Some(
+        delegated_tx,
+    ))))));
+    let ev = server.event_sender().clone();
+
+    let mut client_config = default_client_config();
+    client_config.credentials = connector::Credentials::UsernamePassword {
+        username: username.into(),
+        password: password.into(),
+    };
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(Box::pin(async move {
+            let server = tokio::task::spawn_local(async move { server.run().await });
+            let (tx, rx) = oneshot::channel();
+            ev.send(ServerEvent::GetLocalAddr(tx)).unwrap();
+            let server_addr = rx.await.unwrap().unwrap();
+
+            let result = async {
+                let tcp_stream = TcpStream::connect(server_addr).await?;
+                let client_addr = tcp_stream.local_addr()?;
+                let mut framed = ironrdp_tokio::TokioFramed::new(tcp_stream);
+                let mut connector = connector::ClientConnector::new(client_config, client_addr);
+                let should_upgrade = ironrdp_async::connect_begin(&mut framed, &mut connector).await?;
+                let (upgraded_stream, tls_cert) =
+                    ironrdp_tls::upgrade(framed.into_inner_no_leftover(), "localhost").await?;
+                let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+                let mut upgraded_framed = ironrdp_tokio::TokioFramed::new(upgraded_stream);
+                let server_public_key =
+                    ironrdp_tls::extract_tls_server_public_key(&tls_cert).context("server public key")?;
+                ironrdp_async::connect_finalize(
+                    upgraded,
+                    connector,
+                    &mut upgraded_framed,
+                    &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
+                    "localhost".into(),
+                    server_public_key.to_owned(),
+                    None,
+                )
+                .await?;
+                // The server validates the credentials once the connection sequence is over.
+                Ok(tokio::time::timeout(Duration::from_secs(10), delegated_rx).await??)
+            }
+            .await;
+
+            server.await.unwrap()?;
+            result
+        }))
+        .await
 }

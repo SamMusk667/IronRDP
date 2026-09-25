@@ -263,7 +263,7 @@ impl RdpServerBuilder<BuilderDone> {
         self
     }
 
-    /// Set a credential validator for TLS-mode connections.
+    /// Set a credential validator.
     ///
     /// When set, credentials received from the client during
     /// `SecureSettingsExchange` (`ClientInfoPdu`) are passed to this
@@ -271,8 +271,8 @@ impl RdpServerBuilder<BuilderDone> {
     /// error closes the connection. Pass `None` (the default) to skip
     /// validation entirely.
     ///
-    /// Not used for CredSSP/Hybrid connections (those use pre-loaded
-    /// credentials for NTLM challenge-response).
+    /// For CredSSP/Hybrid connections, the validator checks the credentials
+    /// the client delegated once CredSSP authenticated it.
     pub fn with_credential_validator(mut self, validator: Option<Arc<dyn CredentialValidator>>) -> Self {
         self.state.credential_validator = validator;
         self

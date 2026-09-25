@@ -10,6 +10,8 @@ use ironrdp_acceptor::{Acceptor, AcceptorResult, BeginResult, DesktopSize};
 use ironrdp_async::Framed;
 use ironrdp_cliprdr::CliprdrServer;
 use ironrdp_cliprdr::backend::ClipboardMessage;
+use ironrdp_connector::sspi::AuthIdentity;
+use ironrdp_connector::sspi::credssp::CredentialsProxy;
 use ironrdp_core::{decode, encode_vec, impl_as_any};
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_displaycontrol::server::{DisplayControlHandler, DisplayControlServer};
@@ -140,11 +142,13 @@ impl core::error::Error for CredentialValidationError {
     }
 }
 
-/// Server-side credential validator for TLS-mode connections.
+/// Server-side credential validator.
 ///
-/// Called during connection setup when the server receives client credentials
-/// via `ClientInfoPdu`. Not used for CredSSP/Hybrid connections (those use
-/// pre-loaded credentials for NTLM challenge-response).
+/// Called during connection setup when the server receives client credentials:
+/// via `ClientInfoPdu` for TLS-mode connections, and as the credentials the
+/// client delegates at the end of CredSSP for Hybrid connections, after CredSSP
+/// verified the client against the pre-loaded credentials or the
+/// [credentials lookup](RdpServer::set_credentials_lookup).
 ///
 /// Implement this trait to validate credentials against external systems
 /// (PAM, LDAP, database, etc.). For blocking backends, wrap the call in
@@ -447,6 +451,7 @@ pub struct RdpServer {
     ev_sender: mpsc::UnboundedSender<ServerEvent>,
     ev_receiver: Arc<Mutex<mpsc::UnboundedReceiver<ServerEvent>>>,
     creds: Option<Credentials>,
+    credentials_lookup: Option<Box<dyn CredentialsProxy<AuthenticationData = AuthIdentity> + Send>>,
     credential_validator: Option<Arc<dyn CredentialValidator>>,
     local_addr: Option<SocketAddr>,
     autodetect: Option<AutoDetectManager>,
@@ -545,6 +550,7 @@ impl RdpServer {
             ev_sender,
             ev_receiver: Arc::new(Mutex::new(ev_receiver)),
             creds: None,
+            credentials_lookup: None,
             credential_validator: None,
             local_addr: None,
             autodetect: None,
@@ -563,7 +569,7 @@ impl RdpServer {
         builder::RdpServerBuilder::new()
     }
 
-    /// Set or clear the credential validator for TLS-mode connections.
+    /// Set or clear the credential validator.
     ///
     /// When set, credentials received from the client during
     /// `SecureSettingsExchange` are validated through this callback before
@@ -577,9 +583,24 @@ impl RdpServer {
     /// ([`RdpServer::builder`]); this setter exists for dynamic
     /// post-construction reconfiguration.
     ///
-    /// Not used for CredSSP/Hybrid connections (those use pre-loaded credentials).
+    /// For CredSSP/Hybrid connections, the validator checks the credentials
+    /// the client delegated once CredSSP authenticated it.
     pub fn set_credential_validator(&mut self, validator: Option<Arc<dyn CredentialValidator>>) {
         self.credential_validator = validator;
+    }
+
+    /// Set or clear the lookup CredSSP verifies Hybrid clients against.
+    ///
+    /// Given the name a client authenticates as, the lookup returns that
+    /// account's password or NT hash (see
+    /// [`CredsspSequence::init_with_lookup`](ironrdp_acceptor::credssp::CredsspSequence::init_with_lookup)),
+    /// so that more than one account can log on. While it is set, it takes
+    /// the place of the credentials from [`Self::set_credentials`] for CredSSP.
+    pub fn set_credentials_lookup(
+        &mut self,
+        lookup: Option<Box<dyn CredentialsProxy<AuthenticationData = AuthIdentity> + Send>>,
+    ) {
+        self.credentials_lookup = lookup;
     }
 
     pub fn event_sender(&self) -> &mpsc::UnboundedSender<ServerEvent> {
@@ -880,15 +901,28 @@ impl RdpServer {
             // uses this value in practice.
             let client_name = "rdp-client".to_owned();
 
-            ironrdp_acceptor::accept_credssp(
-                &mut framed,
-                &mut acceptor,
-                &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
-                client_name.into(),
-                pub_key.clone(),
-                None,
-            )
-            .await?;
+            if let Some(lookup) = self.credentials_lookup.as_deref_mut() {
+                ironrdp_acceptor::accept_credssp_with_lookup(
+                    &mut framed,
+                    &mut acceptor,
+                    &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
+                    client_name.into(),
+                    pub_key.clone(),
+                    None,
+                    lookup,
+                )
+                .await?;
+            } else {
+                ironrdp_acceptor::accept_credssp(
+                    &mut framed,
+                    &mut acceptor,
+                    &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
+                    client_name.into(),
+                    pub_key.clone(),
+                    None,
+                )
+                .await?;
+            }
         }
 
         let framed = self.accept_finalize(framed, acceptor).await?;
