@@ -304,6 +304,14 @@ pub trait RdpServerDisplay: Send {
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
         debug!(?layout, "Requesting layout")
     }
+
+    /// The client asked for the whole picture again: a Refresh Rect PDU, or a Suppress Output PDU
+    /// allowing display updates (MS-RDPBCGR 2.2.11.2, 2.2.11.3), which mstsc sends when its
+    /// window is restored. A display whose updates build on earlier ones, such as an H.264
+    /// stream, should send a complete picture next.
+    fn request_refresh(&mut self) {
+        debug!("Requesting refresh")
+    }
 }
 
 #[cfg(test)]

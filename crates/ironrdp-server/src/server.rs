@@ -1624,6 +1624,9 @@ impl RdpServer {
                     let suppress = pdu.desktop_rect.is_none();
                     self.display_suppressed.store(suppress, Ordering::Relaxed);
                     debug!(suppress, "client suppress-output state changed");
+                    if !suppress {
+                        self.display.lock().await.request_refresh();
+                    }
                 }
 
                 // Client asks the server to redraw a rectangle — typical on
@@ -1637,6 +1640,7 @@ impl RdpServer {
                     if self.display_suppressed.swap(false, Ordering::Relaxed) {
                         debug!("client RefreshRectangle cleared suppress-output state");
                     }
+                    self.display.lock().await.request_refresh();
                 }
 
                 unexpected => {
