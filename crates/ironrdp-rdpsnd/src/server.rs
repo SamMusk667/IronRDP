@@ -1,3 +1,6 @@
+use core::time::Duration;
+use std::time::Instant;
+
 use ironrdp_core::{Decode as _, ReadCursor, impl_as_any};
 use ironrdp_pdu::gcc::ChannelName;
 use ironrdp_pdu::{PduResult, decode_err, pdu_other_err};
@@ -117,6 +120,14 @@ pub trait RdpsndServerHandler: Send + core::fmt::Debug {
     /// Called when the audio stream is torn down (e.g. the client closed the
     /// channel or the session ended).
     fn stop(&mut self);
+
+    /// The client finished playing a wave (Wave Confirm PDU). `since_sent` is
+    /// how long ago the wave was sent, which is how far behind the server's
+    /// audio the client plays; `held` is how long the client reports it held
+    /// the wave between receiving it and finishing it (MS-RDPEA 3.2.5.2.1.6).
+    fn on_wave_confirm(&mut self, since_sent: Duration, held: Duration) {
+        let _ = (since_sent, held);
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -137,6 +148,10 @@ pub struct RdpsndServer {
     quality_mode: Option<QualityMode>,
     block_no: u8,
     format_no: Option<u16>,
+    /// Start of the millisecond clock stamped on waves as `wTimeStamp`.
+    epoch: Instant,
+    /// Each wave in flight by block number: its `wTimeStamp` and when it was sent.
+    sent: [Option<(u16, Instant)>; 256],
 }
 
 impl RdpsndServer {
@@ -150,6 +165,8 @@ impl RdpsndServer {
             quality_mode: None,
             format_no: None,
             block_no: 0,
+            epoch: Instant::now(),
+            sent: [None; 256],
         }
     }
 
@@ -188,10 +205,20 @@ impl RdpsndServer {
             .ok_or_else(|| pdu_other_err!("invalid state - no format"))?;
 
         // The server doesn't wait for wave confirm, apparently FreeRDP neither.
+        // wTimeStamp is when the PDU is built (MS-RDPEA 2.2.3.10), in milliseconds
+        // on a clock that wraps; the client echoes it back plus how long it held
+        // the wave.
+        let now = Instant::now();
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            reason = "the clock wraps at 16 bits"
+        )]
+        let timestamp = now.duration_since(self.epoch).as_millis() as u16;
         let msg = if version >= pdu::Version::V8 {
             let pdu = pdu::Wave2Pdu {
                 block_no: self.block_no,
-                timestamp: 0,
+                timestamp,
                 audio_timestamp: ts,
                 format_no,
                 data: data.into(),
@@ -201,12 +228,13 @@ impl RdpsndServer {
             let pdu = pdu::WavePdu {
                 block_no: self.block_no,
                 format_no,
-                timestamp: 0,
+                timestamp,
                 data: data.into(),
             };
             RdpsndSvcMessages::new(vec![pdu::ServerAudioOutputPdu::Wave(pdu).into()])
         };
 
+        self.sent[usize::from(self.block_no)] = Some((timestamp, now));
         self.block_no = self.block_no.overflowing_add(1).0;
 
         Ok(msg)
@@ -357,6 +385,10 @@ impl SvcProcessor for RdpsndServer {
             RdpsndState::Ready => {
                 if let pdu::ClientAudioOutputPdu::WaveConfirm(c) = pdu {
                     debug!(?c);
+                    if let Some((timestamp, sent_at)) = self.sent[usize::from(c.block_no)].take() {
+                        let held = Duration::from_millis(u64::from(c.timestamp.wrapping_sub(timestamp)));
+                        self.handler.on_wave_confirm(sent_at.elapsed(), held);
+                    }
                 }
                 vec![]
             }
