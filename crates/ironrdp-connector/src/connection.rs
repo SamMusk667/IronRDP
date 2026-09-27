@@ -772,7 +772,9 @@ fn respond_to_connect_time_autodetect(
     }
 }
 
-#[expect(single_use_lifetimes)] // anonymous lifetimes in `impl Trait` are unstable
+// Older rustc lints the single-use `'a`, which cannot be elided here: anonymous lifetimes in
+// `impl Trait` are unstable. Rustc 1.98 no longer does, so an #[expect] would go unfulfilled.
+#[allow(single_use_lifetimes)]
 fn create_gcc_blocks<'a>(
     config: &Config,
     selected_protocol: nego::SecurityProtocol,
