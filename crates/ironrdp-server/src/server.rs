@@ -1187,8 +1187,17 @@ impl RdpServer {
                             error!(?error, "Handling clipboard event");
                             continue;
                         }
-                    }
-                    .context("failed to send clipboard event")?;
+                    };
+                    // A clipboard request the channel cannot honour (say a file copy the client
+                    // never negotiated, or file contents for a request it gave up on) costs the
+                    // clipboard that one message, not the whole session.
+                    let msgs = match msgs {
+                        Ok(msgs) => msgs,
+                        Err(error) => {
+                            warn!(error = format!("{error:#}"), "Dropping clipboard event");
+                            continue;
+                        }
+                    };
                     let channel_id = self
                         .get_channel_id_by_type::<CliprdrServer>()
                         .context("SVC channel not found")?;
