@@ -2839,6 +2839,9 @@ impl RdpServer {
             .filter(|e| matches!(e, ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(..))))
             .count();
         let mut wave_skip = wave_total.saturating_sub(WAVE_KEEP);
+        // Drive redirection goes last: a file transfer written ahead of sound and video would hold
+        // them back for as long as it takes to send. The sort is stable, so each kind keeps its order.
+        events.sort_by_key(|event| matches!(event, ServerEvent::Rdpdr(_)));
         for event in events.drain(..) {
             trace!(?event, "Dispatching");
             match event {
