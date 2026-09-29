@@ -1,3 +1,5 @@
+mod server_direction;
+
 use ironrdp_core::encode_vec;
 use ironrdp_rdpdr::pdu::RdpdrPdu;
 use ironrdp_rdpdr::pdu::efs::{

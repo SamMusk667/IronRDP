@@ -11,7 +11,7 @@ use self::efs::{
     ClientDriveQueryInformationResponse, ClientDriveQueryVolumeInformationResponse, ClientDriveSetInformationResponse,
     ClientNameRequest, CoreCapability, CoreCapabilityKind, DeviceCloseResponse, DeviceControlResponse,
     DeviceCreateResponse, DeviceIoRequest, DeviceReadResponse, DeviceWriteResponse, ServerDeviceAnnounceResponse,
-    VersionAndIdPdu, VersionAndIdPduKind,
+    ServerDriveIoRequest, VersionAndIdPdu, VersionAndIdPduKind,
 };
 
 pub mod efs;
@@ -212,6 +212,53 @@ impl Encode for RdpdrPdu {
 }
 
 impl SvcEncode for RdpdrPdu {}
+
+/// Server-direction encoding of the drive I/O requests (PAKID_CORE_DEVICE_IOREQUEST) a server sends:
+/// `ServerDriveIoRequest::decode` is what a client uses to parse them. Only the requests a server
+/// needs to work with files can be encoded; the others are an error.
+impl Encode for ServerDriveIoRequest {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        SharedHeader {
+            component: Component::RdpdrCtypCore,
+            packet_id: PacketId::CoreDeviceIoRequest,
+        }
+        .encode(dst)?;
+        match self {
+            ServerDriveIoRequest::ServerCreateDriveRequest(req) => req.encode(dst),
+            ServerDriveIoRequest::ServerDriveQueryInformationRequest(req) => req.encode(dst),
+            ServerDriveIoRequest::DeviceReadRequest(req) => req.encode(dst),
+            ServerDriveIoRequest::DeviceWriteRequest(req) => req.encode(dst),
+            ServerDriveIoRequest::DeviceCloseRequest(req) => req.encode(dst),
+            ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(req) => req.encode(dst),
+            ServerDriveIoRequest::ServerDriveSetInformationRequest(req) => req.encode(dst),
+            other => Err(unsupported_value_err!(
+                "ServerDriveIoRequest::encode",
+                "ServerDriveIoRequest",
+                format!("{other:?}")
+            )),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "DR_DRIVE_CORE_DEVICE_IOREQUEST"
+    }
+
+    fn size(&self) -> usize {
+        SharedHeader::SIZE
+            + match self {
+                ServerDriveIoRequest::ServerCreateDriveRequest(req) => req.size(),
+                ServerDriveIoRequest::ServerDriveQueryInformationRequest(req) => req.size(),
+                ServerDriveIoRequest::DeviceReadRequest(req) => req.size(),
+                ServerDriveIoRequest::DeviceWriteRequest(req) => req.size(),
+                ServerDriveIoRequest::DeviceCloseRequest(req) => req.size(),
+                ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(req) => req.size(),
+                ServerDriveIoRequest::ServerDriveSetInformationRequest(req) => req.size(),
+                _ => 0,
+            }
+    }
+}
+
+impl SvcEncode for ServerDriveIoRequest {}
 
 impl fmt::Debug for RdpdrPdu {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
