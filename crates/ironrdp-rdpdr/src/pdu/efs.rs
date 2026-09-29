@@ -5282,6 +5282,16 @@ impl ClientDriveSetInformationResponse {
         })
     }
 
+    /// The reply header: which request this answers, and its status.
+    pub fn device_io_reply(&self) -> &DeviceIoResponse {
+        &self.device_io_reply
+    }
+
+    /// The length of the information the client set, as it reports it.
+    pub fn length(&self) -> u32 {
+        self.length
+    }
+
     pub fn name(&self) -> &'static str {
         Self::NAME
     }

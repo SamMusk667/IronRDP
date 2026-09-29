@@ -1109,6 +1109,9 @@ fn client_drive_set_information_response_round_trips() {
     // Fields are private; encoding both and comparing bytes is the round-trip check.
     let re_encoded = encode_to_vec(decoded.size(), |dst| decoded.encode(dst));
     assert_eq!(re_encoded[12..], encoded[12..]);
+    // A server backend reads which request this answers, and how, through the accessors.
+    assert_eq!(decoded.device_io_reply(), &some_device_io_response());
+    assert_eq!(decoded.length(), 8);
 }
 
 #[test]
