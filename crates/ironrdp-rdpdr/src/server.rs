@@ -555,7 +555,11 @@ impl RdpdrServer {
             "received ClientCoreCapabilityResponse"
         );
         self.state = RdpdrServerState::Active;
-        Ok(Vec::new())
+        // Clients announce drives, printers and ports only once the server says a user has logged
+        // on; before that they announce smart cards at most (FreeRDP, mstsc). A client reaches this
+        // point only after the connection has authenticated its user, so the server says so as soon
+        // as the capabilities are exchanged, as a Windows server does after logon.
+        Ok(vec![SvcMessage::from(RdpdrPdu::UserLoggedon)])
     }
 
     fn handle_device_list_announce(&mut self, src: &mut ReadCursor<'_>) -> PduResult<Vec<SvcMessage>> {

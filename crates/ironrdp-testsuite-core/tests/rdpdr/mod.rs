@@ -1690,7 +1690,13 @@ fn handshake_to_active(server: &mut RdpdrServer) -> u32 {
         kind: CoreCapabilityKind::ClientCoreCapabilityResponse,
     }))
     .unwrap();
-    assert!(server.process(&capability_response).unwrap().is_empty());
+    // Server User Logged On: without it, clients announce no drives.
+    let logged_on = server.process(&capability_response).unwrap();
+    assert_eq!(logged_on.len(), 1);
+    assert_eq!(
+        logged_on[0].encode_unframed_pdu().unwrap(),
+        encode_vec(&RdpdrPdu::UserLoggedon).unwrap()
+    );
 
     client_id
 }
