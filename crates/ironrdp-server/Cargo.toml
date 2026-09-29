@@ -34,7 +34,7 @@ __bench = ["dep:visibility"]
 
 [dependencies]
 anyhow = "1.0"
-tokio = { version = "1", features = ["net", "macros", "sync", "rt"] } # public
+tokio = { version = "1", features = ["net", "macros", "sync", "rt", "time"] } # public
 tokio-rustls = "0.26" # public
 async-trait = "0.1"
 ironrdp-async = { path = "../ironrdp-async", version = "0.10" }
@@ -53,6 +53,7 @@ ironrdp-acceptor = { path = "../ironrdp-acceptor", version = "0.10" } # public
 ironrdp-connector = { path = "../ironrdp-connector", version = "0.10" } # public
 ironrdp-graphics = { path = "../ironrdp-graphics", version = "0.9" } # public
 ironrdp-rdpsnd = { path = "../ironrdp-rdpsnd", version = "0.9" } # public
+ironrdp-rdpdr = { path = "../ironrdp-rdpdr", version = "0.7" } # public
 tracing = { version = "0.1", features = ["log"] }
 x509-cert = { version = "0.2", optional = true }
 rustls-pemfile = { version = "2.2", optional = true }
@@ -63,7 +64,7 @@ qoicoubeh = { version = "0.5", optional = true }
 zstd-safe = { version = "7.2", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "test-util"] }
 
 [lints]
 workspace = true

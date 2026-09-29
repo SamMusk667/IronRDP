@@ -44,6 +44,7 @@ use crate::encoder::{UpdateEncoder, UpdateEncoderCodecs};
 #[cfg(feature = "egfx")]
 use crate::gfx::{EgfxServerMessage, GfxServerFactory};
 use crate::handler::RdpServerInputHandler;
+use crate::rdpdr::{RdpdrServer, RdpdrServerFactory, RdpdrServerMessage};
 use crate::{SoundServerFactory, builder, capabilities};
 
 /// TCP listen backlog size for the RDP server socket.
@@ -443,6 +444,7 @@ pub struct RdpServer {
     static_channels: StaticChannelSet,
     sound_factory: Option<Box<dyn SoundServerFactory>>,
     cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
+    rdpdr_factory: Option<Box<dyn RdpdrServerFactory>>,
     echo_handle: EchoServerHandle,
     #[cfg(feature = "egfx")]
     gfx_factory: Option<Box<dyn GfxServerFactory>>,
@@ -482,6 +484,7 @@ pub enum ServerEvent {
     Quit(String),
     Clipboard(ClipboardMessage),
     Rdpsnd(RdpsndServerMessage),
+    Rdpdr(RdpdrServerMessage),
     Echo(EchoServerMessage),
     SetCredentials(Credentials),
     GetLocalAddr(oneshot::Sender<Option<SocketAddr>>),
@@ -519,6 +522,7 @@ impl RdpServer {
         display: Box<dyn RdpServerDisplay>,
         mut sound_factory: Option<Box<dyn SoundServerFactory>>,
         mut cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
+        rdpdr_factory: Option<Box<dyn RdpdrServerFactory>>,
         connection_handler: Option<Box<dyn ConnectionHandler>>,
         #[cfg(feature = "egfx")] mut gfx_factory: Option<Box<dyn GfxServerFactory>>,
         display_suppressed: Option<Arc<AtomicBool>>,
@@ -542,6 +546,7 @@ impl RdpServer {
             static_channels: StaticChannelSet::new(),
             sound_factory,
             cliprdr_factory,
+            rdpdr_factory,
             echo_handle: EchoServerHandle::new(ev_sender.clone()),
             #[cfg(feature = "egfx")]
             gfx_factory,
@@ -699,6 +704,12 @@ impl RdpServer {
             let backend = factory.build_backend();
 
             acceptor.attach_static_channel(RdpsndServer::new(backend));
+        }
+
+        if let Some(factory) = self.rdpdr_factory.as_deref() {
+            let backend = factory.build_backend();
+
+            acceptor.attach_static_channel(RdpdrServer::new(backend, self.ev_sender.clone()));
         }
 
         let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display));
@@ -1130,6 +1141,9 @@ impl RdpServer {
             .filter(|e| matches!(e, ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(..))))
             .count();
         let mut wave_skip = wave_total.saturating_sub(WAVE_KEEP);
+        // Drive redirection goes last: a file transfer written ahead of sound and video would hold
+        // them back for as long as it takes to send. The sort is stable, so each kind keeps its order.
+        events.sort_by_key(|event| matches!(event, ServerEvent::Rdpdr(_)));
         for event in events.drain(..) {
             trace!(?event, "Dispatching");
             match event {
@@ -1169,6 +1183,14 @@ impl RdpServer {
                         .get_channel_id_by_type::<RdpsndServer>()
                         .context("SVC channel not found")?;
                     let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                    writer.write_all(&data).await?;
+                }
+                ServerEvent::Rdpdr(RdpdrServerMessage::SendMessages(messages)) => {
+                    let Some(channel_id) = self.get_channel_id_by_type::<RdpdrServer>() else {
+                        warn!("No rdpdr channel, dropping event");
+                        continue;
+                    };
+                    let data = server_encode_svc_messages(messages, channel_id, user_channel_id)?;
                     writer.write_all(&data).await?;
                 }
                 ServerEvent::Clipboard(c) => {

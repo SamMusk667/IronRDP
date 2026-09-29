@@ -2860,6 +2860,7 @@ dependencies = [
  "ironrdp-graphics",
  "ironrdp-nscodec",
  "ironrdp-pdu",
+ "ironrdp-rdpdr",
  "ironrdp-rdpsnd",
  "ironrdp-svc",
  "ironrdp-tokio",

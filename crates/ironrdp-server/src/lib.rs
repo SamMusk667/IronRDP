@@ -19,6 +19,7 @@ mod gfx;
 mod handler;
 #[cfg(feature = "helper")]
 mod helper;
+mod rdpdr;
 mod server;
 mod sound;
 
@@ -37,6 +38,10 @@ pub use server::{
     ConnectionHandler, CredentialDecision, CredentialValidationError, CredentialValidator, Credentials,
     ExactMatchCredentialValidator, PostConnectionAction, RdpServer, RdpServerOptions, RdpServerSecurity, ServerEvent,
     ServerEventSender, TransportTls,
+};
+pub use rdpdr::{
+    AnnouncedDrive, CreateMode, DEFAULT_REQUEST_TIMEOUT, DirEntry, FileAttributes, FileInfo, NtStatus, RdpdrError, RdpdrHandle,
+    RdpdrResult, RdpdrServer, RdpdrServerFactory, RdpdrServerHandler, RdpdrServerMessage,
 };
 pub use sound::{RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
 
