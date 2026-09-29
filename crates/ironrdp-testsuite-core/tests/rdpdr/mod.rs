@@ -1563,6 +1563,7 @@ struct TrackingServerBackend {
     removed: Vec<u32>,
     client_name: Option<String>,
     completions: Vec<&'static str>,
+    sent: Vec<u32>,
 }
 
 impl_as_any!(TrackingServerBackend);
@@ -1652,6 +1653,10 @@ impl RdpdrServerBackend for TrackingServerBackend {
         self.completions.push("set_security");
         Ok(())
     }
+
+    fn on_request_sent(&mut self, completion_id: u32) {
+        self.sent.push(completion_id);
+    }
 }
 
 /// Drives a fresh [`RdpdrServer`] through the full MS-RDPEFS initialization handshake
@@ -1731,6 +1736,27 @@ fn full_handshake_reaches_active_state() {
             .as_deref(),
         Some("test-client")
     );
+}
+
+#[test]
+fn backend_learns_the_completion_id_of_each_request_in_order() {
+    let mut server = RdpdrServer::new(Box::new(TrackingServerBackend::default()));
+    handshake_to_active(&mut server);
+    let device_id = 1;
+
+    let create = server
+        .drive_create(
+            device_id,
+            "\\a.txt",
+            DesiredAccess::FILE_READ_DATA_OR_FILE_LIST_DIRECTORY,
+            CreateDisposition::FILE_OPEN,
+            CreateOptions::empty(),
+        )
+        .unwrap();
+    let read = server.drive_read(device_id, 1, 16, 0).unwrap();
+
+    let told = &server.downcast_backend::<TrackingServerBackend>().unwrap().sent;
+    assert_eq!(told, &[completion_id_of(&create[0]), completion_id_of(&read[0])]);
 }
 
 #[test]

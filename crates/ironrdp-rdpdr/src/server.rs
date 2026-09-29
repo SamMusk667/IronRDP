@@ -230,6 +230,16 @@ pub trait RdpdrServerBackend: AsAny + fmt::Debug + Send {
     fn on_query_security_complete(&mut self, response: &ClientDriveQuerySecurityResponse) -> PduResult<()>;
     fn on_set_security_complete(&mut self, response: &ClientDriveSetSecurityResponse) -> PduResult<()>;
 
+    /// A drive I/O request goes out under `completion_id`, the ID its completion will carry.
+    ///
+    /// Requests go out in the order the embedder asked for them, one call per request, so a
+    /// backend that keeps its own record of the requests it asked for, in that order, learns
+    /// here which completion answers which: the `drive_*` methods choose the ID themselves, and
+    /// the completion callbacks carry only the ID. The default implementation ignores it.
+    fn on_request_sent(&mut self, completion_id: u32) {
+        let _ = completion_id;
+    }
+
     /// Notifies the backend that the RDPDR channel is closing.
     ///
     /// Defaulted to a no-op: this module has no call site for it yet. `SvcProcessor`
@@ -671,6 +681,7 @@ impl RdpdrServer {
         dst.write_u16(Component::RdpdrCtypCore.into());
         dst.write_u16(PacketId::CoreDeviceIoRequest.into());
         request.encode_into(&mut dst).map_err(|e| encode_err!(e))?;
+        self.backend.on_request_sent(completion_id);
 
         Ok(vec![SvcMessage::from(bytes)])
     }
