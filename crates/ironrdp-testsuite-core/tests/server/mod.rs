@@ -1,4 +1,10 @@
 mod acceptor;
 mod autodetect;
+mod connection_policy;
 mod credential_validator;
 mod fast_path;
+mod finalize_timeout;
+mod multitransport_finalize;
+mod rdpdr;
+mod rdpei;
+mod remotefx_entropy_coder;

@@ -234,6 +234,34 @@ impl AudioFormat {
         + 2 /* nBlockAlign */
         + 2 /* wBitsPerSample */
         + 2 /* cbSize */;
+
+    /// Compare two audio formats for negotiation.
+    ///
+    /// WAVEFORMATEX identity fields — wave format tag, channel count, sample rate,
+    /// bit depth — must match, and so must the codec-specific extra-data blob (`data`).
+    ///
+    /// For PCM, `n_avg_bytes_per_sec` and `n_block_align` are derived from the other
+    /// fields and may legitimately differ between peers, so they are ignored.
+    /// For compressed formats those fields are codec-specific (bitrate / block layout)
+    /// and must match. Extra-format bytes (`data`) always compare: ignoring them could
+    /// match incompatible codec configurations (for example AAC HEAACWAVEINFO).
+    pub fn matches_for_negotiation(&self, other: &Self) -> bool {
+        let identity = self.format == other.format
+            && self.n_channels == other.n_channels
+            && self.n_samples_per_sec == other.n_samples_per_sec
+            && self.bits_per_sample == other.bits_per_sample
+            && self.data == other.data;
+
+        if !identity {
+            return false;
+        }
+
+        if self.format == WaveFormat::PCM {
+            true
+        } else {
+            self.n_avg_bytes_per_sec == other.n_avg_bytes_per_sec && self.n_block_align == other.n_block_align
+        }
+    }
 }
 
 impl Encode for AudioFormat {
@@ -247,7 +275,7 @@ impl Encode for AudioFormat {
         dst.write_u16(self.n_block_align);
         dst.write_u16(self.bits_per_sample);
         let len = self.data.as_ref().map_or(0, |d| d.len());
-        dst.write_u16(cast_length!("AudioFormat::cbSize", len)?);
+        dst.write_u16(cast_length!("AudioFormat::cbSize", len, in: dst)?);
         if let Some(data) = &self.data {
             dst.write_slice(data);
         }
@@ -276,7 +304,7 @@ impl<'de> Decode<'de> for AudioFormat {
         let n_avg_bytes_per_sec = src.read_u32();
         let n_block_align = src.read_u16();
         let bits_per_sample = src.read_u16();
-        let cb_size = cast_length!("cbSize", src.read_u16())?;
+        let cb_size = cast_length!("cbSize", src.read_u16(), in: src)?;
 
         ensure_size!(in: src, size: cb_size);
         let data = if cb_size > 0 {
@@ -325,7 +353,7 @@ impl Encode for ServerAudioFormatPdu {
         write_padding!(dst, 4); /* volume */
         write_padding!(dst, 4); /* pitch */
         write_padding!(dst, 2); /* DGramPort */
-        dst.write_u16(cast_length!("AudioFormatPdu::n_formats", self.formats.len())?);
+        dst.write_u16(cast_length!("AudioFormatPdu::n_formats", self.formats.len(), in: dst)?);
         write_padding!(dst, 1); /* blockNo */
         dst.write_u16(self.version.into());
         write_padding!(dst, 1);
@@ -419,7 +447,7 @@ impl Encode for ClientAudioFormatPdu {
         dst.write_u32(volume);
         dst.write_u32(self.pitch);
         dst.write_u16_be(self.dgram_port);
-        dst.write_u16(cast_length!("AudioFormatPdu::n_formats", self.formats.len())?);
+        dst.write_u16(cast_length!("AudioFormatPdu::n_formats", self.formats.len(), in: dst)?);
         dst.write_u8(0); /* blockNo */
         dst.write_u16(self.version.into());
         write_padding!(dst, 1);
@@ -611,7 +639,7 @@ impl Encode for TrainingPdu {
         } else {
             self.size() + ServerAudioOutputPdu::FIXED_PART_SIZE
         };
-        dst.write_u16(cast_length!("TrainingPdu::wPackSize", len)?);
+        dst.write_u16(cast_length!("TrainingPdu::wPackSize", len, in: dst)?);
         dst.write_slice(&self.data);
 
         Ok(())
@@ -636,7 +664,7 @@ impl<'de> Decode<'de> for TrainingPdu {
         let len = usize::from(src.read_u16());
         let data = if len != 0 {
             if len < Self::FIXED_PART_SIZE + ServerAudioOutputPdu::FIXED_PART_SIZE {
-                return Err(invalid_field_err!("TrainingPdu::wPackSize", "too small"));
+                return Err(invalid_field_err!("TrainingPdu::wPackSize", "too small", in: src));
             }
             let len = len - Self::FIXED_PART_SIZE - ServerAudioOutputPdu::FIXED_PART_SIZE;
             ensure_size!(in: src, size: len);
@@ -753,28 +781,109 @@ impl<'de> Decode<'de> for WaveInfoPdu {
     }
 }
 
+/// Pre-v8 WaveInfo PDU body (`SNDC_WAVE`).
+///
+/// MS-RDPEA §2.2.3.3 / §2.2.3.4: servers send WaveInfo first, then a *separate*
+/// bare Wave payload ([`WaveDataPdu`]) with no RDPSND header. `BodySize` on the
+/// WaveInfo header is `8 + audio_length` even though only the 12-byte WaveInfo
+/// structure is present in that message.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SndWavePdu {
-    pub data: Vec<u8>,
+pub struct WavePdu {
+    pub timestamp: u16,
+    pub format_no: u16,
+    pub block_no: u8,
+    /// First four bytes of the audio sample (WaveInfo `Data` field).
+    pub data_prefix: [u8; 4],
+    /// Total audio sample length including [`Self::data_prefix`].
+    pub audio_length: u16,
 }
 
-impl SndWavePdu {
-    const NAME: &'static str = "SNDWAVE";
+impl WavePdu {
+    const NAME: &'static str = "WavePdu";
 
-    const FIXED_PART_SIZE: usize = 4 /* bPad */;
+    /// Minimum audio length: the WaveInfo Data field always carries four bytes.
+    pub const MIN_AUDIO_LENGTH: u16 = 4;
 
-    fn decode(src: &mut ReadCursor<'_>, data_len: usize) -> DecodeResult<Self> {
-        ensure_fixed_part_size!(in: src);
+    /// Maximum audio length so `BodySize = 8 + n` still fits in the 16-bit header field.
+    pub const MAX_AUDIO_LENGTH: u16 = u16::MAX - 8;
 
-        read_padding!(src, 4);
-        ensure_size!(in: src, size: data_len);
-        let data = src.read_slice(data_len).into();
+    fn body_size(&self) -> usize {
+        // MS-RDPEA §2.2.3.3: BodySize = 8 + n, where n is the full audio sample length.
+        // INVARIANT: audio_length <= MAX_AUDIO_LENGTH, so this fits in u16.
+        8usize
+            .checked_add(usize::from(self.audio_length))
+            .expect("never overflow")
+    }
 
-        Ok(Self { data })
+    fn decode(src: &mut ReadCursor<'_>, body_size: u16) -> DecodeResult<Self> {
+        let info = WaveInfoPdu::decode(src)?;
+        let audio_length = body_size
+            .checked_sub(8)
+            .ok_or_else(|| invalid_field_err!("BodySize", "WaveInfo body_size is too small", in: src))?;
+        if audio_length < Self::MIN_AUDIO_LENGTH {
+            return Err(invalid_field_err!(
+                "BodySize",
+                "WaveInfo audio length is smaller than the Data prefix",
+                in: src
+            ));
+        }
+
+        Ok(Self {
+            timestamp: info.timestamp,
+            format_no: info.format_no,
+            block_no: info.block_no,
+            data_prefix: info.data,
+            audio_length,
+        })
     }
 }
 
-impl Encode for SndWavePdu {
+impl Encode for WavePdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        if self.audio_length < Self::MIN_AUDIO_LENGTH {
+            return Err(other_err!("WavePdu", "audio_length must be at least 4"));
+        }
+        if self.audio_length > Self::MAX_AUDIO_LENGTH {
+            return Err(other_err!("WavePdu", "audio_length leaves BodySize outside u16 range"));
+        }
+
+        WaveInfoPdu {
+            timestamp: self.timestamp,
+            format_no: self.format_no,
+            block_no: self.block_no,
+            data: self.data_prefix,
+        }
+        .encode(dst)
+    }
+
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn size(&self) -> usize {
+        // Only the WaveInfo body is encoded in this message.
+        WaveInfoPdu::FIXED_PART_SIZE
+    }
+}
+
+/// Bare Wave payload that follows a pre-v8 [`WavePdu`] / WaveInfo message.
+///
+/// MS-RDPEA §2.2.3.4: no RDPSND header — four-byte `bPad` then the remaining
+/// audio bytes after the WaveInfo Data prefix. Total wire length equals the
+/// WaveInfo `audio_length`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaveDataPdu {
+    /// Audio bytes after the four-byte WaveInfo prefix.
+    pub data: Vec<u8>,
+}
+
+impl WaveDataPdu {
+    const NAME: &'static str = "SNDWAVE";
+
+    const FIXED_PART_SIZE: usize = 4 /* bPad */;
+}
+
+impl Encode for WaveDataPdu {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size());
 
@@ -795,75 +904,7 @@ impl Encode for SndWavePdu {
     }
 }
 
-// combines WaveInfoPdu + WavePdu
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WavePdu<'a> {
-    pub timestamp: u16,
-    pub format_no: u16,
-    pub block_no: u8,
-    pub data: Cow<'a, [u8]>,
-}
-
-impl WavePdu<'_> {
-    const NAME: &'static str = "WavePdu";
-
-    fn body_size(&self) -> usize {
-        (WaveInfoPdu::FIXED_PART_SIZE - 4)
-            .checked_add(self.data.len())
-            .expect("never overflow")
-    }
-}
-
-impl Encode for WavePdu<'_> {
-    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        let info = WaveInfoPdu {
-            timestamp: self.timestamp,
-            format_no: self.format_no,
-            block_no: self.block_no,
-            data: self.data[0..4]
-                .try_into()
-                .map_err(|e| other_err!("invalid data", source: e))?,
-        };
-        let wave = SndWavePdu {
-            data: self.data[4..].into(),
-        };
-        info.encode(dst)?;
-        wave.encode(dst)?;
-        Ok(())
-    }
-
-    fn name(&self) -> &'static str {
-        Self::NAME
-    }
-
-    fn size(&self) -> usize {
-        (WaveInfoPdu::FIXED_PART_SIZE + SndWavePdu::FIXED_PART_SIZE - 4)
-            .checked_add(self.data.len())
-            .expect("never overflow")
-    }
-}
-
-impl WavePdu<'_> {
-    fn decode(src: &mut ReadCursor<'_>, body_size: u16) -> DecodeResult<Self> {
-        let info = WaveInfoPdu::decode(src)?;
-        let body_size = usize::from(body_size);
-        let data_len = body_size
-            .checked_sub(info.size())
-            .ok_or_else(|| invalid_field_err!("Length", "WaveInfo body_size is too small"))?;
-        let wave = SndWavePdu::decode(src, data_len)?;
-
-        let mut data = Vec::with_capacity(wave.size());
-        data.extend_from_slice(&info.data);
-        data.extend_from_slice(&wave.data);
-
-        Ok(Self {
-            timestamp: info.timestamp,
-            format_no: info.format_no,
-            block_no: info.block_no,
-            data: data.into(),
-        })
-    }
-}
+impl SvcEncode for WaveDataPdu {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaveConfirmPdu {
@@ -1152,7 +1193,7 @@ pub enum ServerAudioOutputPdu<'a> {
     AudioFormat(ServerAudioFormatPdu),
     CryptKey(CryptKeyPdu),
     Training(TrainingPdu),
-    Wave(WavePdu<'a>),
+    Wave(WavePdu),
     WaveEncrypt(WaveEncryptPdu),
     Close,
     Wave2(Wave2Pdu<'a>),
@@ -1184,7 +1225,7 @@ impl Encode for ServerAudioOutputPdu<'_> {
 
         dst.write_u8(msg_type);
         write_padding!(dst, 1);
-        dst.write_u16(cast_length!("ServerAudioOutputPdu::bodySize", pdu_size)?);
+        dst.write_u16(cast_length!("ServerAudioOutputPdu::bodySize", pdu_size, in: dst)?);
 
         match self {
             Self::AudioFormat(pdu) => pdu.encode(dst),
@@ -1244,6 +1285,7 @@ impl<'de> Decode<'de> for ServerAudioOutputPdu<'_> {
                 Ok(Self::Training(pdu))
             }
             SNDC_WAVE => {
+                // WaveInfo only — the following SVC message is a bare Wave payload.
                 let pdu = WavePdu::decode(src, body_size)?;
                 Ok(Self::Wave(pdu))
             }
@@ -1264,10 +1306,8 @@ impl<'de> Decode<'de> for ServerAudioOutputPdu<'_> {
                 let pdu = PitchPdu::decode(src)?;
                 Ok(Self::Pitch(pdu))
             }
-            _ => Err(invalid_field_err!(
-                "ServerAudioOutputPdu::msgType",
-                "Unknown audio output PDU type"
-            )),
+            _ => Err(invalid_field_err!( "ServerAudioOutputPdu::msgType",
+                "Unknown audio output PDU type", in: src)),
         }
     }
 }
@@ -1302,7 +1342,7 @@ impl Encode for ClientAudioOutputPdu {
 
         dst.write_u8(msg_type);
         write_padding!(dst, 1);
-        dst.write_u16(cast_length!("ClientAudioOutputPdu::bodySize", body_size)?);
+        dst.write_u16(cast_length!("ClientAudioOutputPdu::bodySize", body_size, in: dst)?);
 
         match self {
             Self::AudioFormat(pdu) => pdu.encode(dst),
@@ -1355,10 +1395,8 @@ impl<'de> Decode<'de> for ClientAudioOutputPdu {
                 let pdu = WaveConfirmPdu::decode(src)?;
                 Ok(Self::WaveConfirm(pdu))
             }
-            _ => Err(invalid_field_err!(
-                "ClientAudioOutputPdu::msgType",
-                "Unknown audio output PDU type"
-            )),
+            _ => Err(invalid_field_err!( "ClientAudioOutputPdu::msgType",
+                "Unknown audio output PDU type", in: src)),
         }
     }
 }

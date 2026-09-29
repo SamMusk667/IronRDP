@@ -46,7 +46,7 @@ impl Encode for DisplayControlPdu {
 
         // This will never overflow as per invariants.
         #[expect(clippy::arithmetic_side_effects)]
-        let pdu_size = cast_length!("pdu size", payload_length + Self::FIXED_PART_SIZE)?;
+        let pdu_size = cast_length!("pdu size", payload_length + Self::FIXED_PART_SIZE, in: dst)?;
 
         // Write `DISPLAYCONTROL_HEADER` fields.
         dst.write_u32(kind);
@@ -87,21 +87,35 @@ impl<'de> Decode<'de> for DisplayControlPdu {
         let kind = src.read_u32();
         let pdu_length = src.read_u32();
 
-        let _payload_length = pdu_length
+        let payload_length = pdu_length
             .checked_sub(Self::FIXED_PART_SIZE.try_into().expect("always in range"))
-            .ok_or_else(|| invalid_field_err!("Length", "Display control PDU length is too small"))?;
+            .ok_or_else(|| invalid_field_err!("Length", "Display control PDU length is too small", in: src))?;
 
-        match kind {
-            DISPLAYCONTROL_PDU_TYPE_CAPS => {
-                let caps = DisplayControlCapabilities::decode(src)?;
-                Ok(DisplayControlPdu::Caps(caps))
-            }
-            DISPLAYCONTROL_PDU_TYPE_MONITOR_LAYOUT => {
-                let layout = DisplayControlMonitorLayout::decode(src)?;
-                Ok(DisplayControlPdu::MonitorLayout(layout))
-            }
-            _ => Err(invalid_field_err!("Type", "Unknown display control PDU type")),
+        if usize::try_from(payload_length).unwrap_or(usize::MAX) != src.len() {
+            return Err(invalid_field_err!(
+                "Length",
+                "Display control PDU length does not match the payload size",
+                in: src
+            ));
         }
+
+        let pdu = match kind {
+            DISPLAYCONTROL_PDU_TYPE_CAPS => DisplayControlPdu::Caps(DisplayControlCapabilities::decode(src)?),
+            DISPLAYCONTROL_PDU_TYPE_MONITOR_LAYOUT => {
+                DisplayControlPdu::MonitorLayout(DisplayControlMonitorLayout::decode(src)?)
+            }
+            _ => return Err(invalid_field_err!("Type", "Unknown display control PDU type", in: src)),
+        };
+
+        if !src.is_empty() {
+            return Err(invalid_field_err!(
+                "Length",
+                "trailing bytes after display control PDU body",
+                in: src
+            ));
+        }
+
+        Ok(pdu)
     }
 }
 
@@ -159,6 +173,17 @@ impl DisplayControlCapabilities {
 
     pub fn max_monitor_area(&self) -> u64 {
         self.max_monitor_area
+    }
+
+    /// One 4K-area (3840x2400) monitor: the single-monitor capabilities every
+    /// existing server advertised before per-display monitor counts existed,
+    /// and the safe fallback for a monitor count that turns out to be invalid.
+    ///
+    /// # Panics
+    ///
+    /// Never: `(1, 3840, 2400)` is always within [`new`](Self::new)'s valid range.
+    pub fn single_monitor() -> Self {
+        Self::new(1, 3840, 2400).expect("(1, 3840, 2400) are always within the valid range")
     }
 }
 
@@ -220,7 +245,7 @@ impl DisplayControlMonitorLayout {
 
     pub fn new(monitors: &[MonitorLayoutEntry]) -> EncodeResult<Self> {
         if monitors.len() > MAX_SUPPORTED_MONITORS.into() {
-            return Err(invalid_field_err!("NumMonitors", "Too many monitors",));
+            return Err(invalid_field_err!("NumMonitors", "Too many monitors"));
         }
 
         let primary_monitors_count = monitors.iter().filter(|monitor| monitor.is_primary()).count();
@@ -293,7 +318,7 @@ impl Encode for DisplayControlMonitorLayout {
             .monitors
             .len()
             .try_into()
-            .map_err(|_| invalid_field_err!("NumMonitors", "Number of monitors is too big"))?;
+            .map_err(|_| invalid_field_err!("NumMonitors", "Number of monitors is too big", in: dst))?;
 
         dst.write_u32(monitors_count);
 
@@ -325,16 +350,14 @@ impl<'de> Decode<'de> for DisplayControlMonitorLayout {
         let monitor_layout_size = src.read_u32();
 
         if monitor_layout_size != MonitorLayoutEntry::FIXED_PART_SIZE.try_into().expect("always in range") {
-            return Err(invalid_field_err!(
-                "MonitorLayoutSize",
-                "Monitor layout size is invalid"
-            ));
+            return Err(invalid_field_err!( "MonitorLayoutSize",
+                "Monitor layout size is invalid", in: src));
         }
 
-        let num_monitors = cast_length!("number of monitors", src.read_u32())?;
+        let num_monitors = cast_length!("number of monitors", src.read_u32(), in: src)?;
 
         if num_monitors > MAX_SUPPORTED_MONITORS.into() {
-            return Err(invalid_field_err!("NumMonitors", "Too many monitors"));
+            return Err(invalid_field_err!("NumMonitors", "Too many monitors", in: src));
         }
 
         let mut monitors = Vec::with_capacity(num_monitors);
@@ -364,16 +387,21 @@ pub struct MonitorLayoutEntry {
     device_scale_factor: u32,
 }
 
+/// Takes `at:` only where a stream position exists.
+///
+/// A constructor validating its arguments has no input stream, so it omits the
+/// offset rather than passing zero: `Some(0)` would render ` at offset 0` and
+/// name a position the caller never read from.
 macro_rules! validate_dimensions {
-    ($width:expr, $height:expr) => {{
+    ($width:expr, $height:expr $(, at: $offset:expr)?) => {{
         if !(200..=8192).contains(&$width) {
-            return Err(invalid_field_err!("Width", "Monitor width is out of range"));
+            return Err(invalid_field_err!("Width", "Monitor width is out of range" $(, at: $offset)?));
         }
         if $width % 2 != 0 {
-            return Err(invalid_field_err!("Width", "Monitor width cannot be odd"));
+            return Err(invalid_field_err!("Width", "Monitor width cannot be odd" $(, at: $offset)?));
         }
         if !(200..=8192).contains(&$height) {
-            return Err(invalid_field_err!("Height", "Monitor height is out of range"));
+            return Err(invalid_field_err!("Height", "Monitor height is out of range" $(, at: $offset)?));
         }
         Ok(())
     }};
@@ -634,7 +662,7 @@ impl<'de> Decode<'de> for MonitorLayoutEntry {
         let desktop_scale_factor = src.read_u32();
         let device_scale_factor = src.read_u32();
 
-        validate_dimensions!(width, height)?;
+        validate_dimensions!(width, height, at: src.pos())?;
 
         Ok(Self {
             is_primary: flags & DISPLAYCONTROL_MONITOR_PRIMARY != 0,

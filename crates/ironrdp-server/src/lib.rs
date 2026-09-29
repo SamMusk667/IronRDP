@@ -3,7 +3,6 @@
 #![allow(clippy::arithmetic_side_effects)] // TODO: should we enable this lint back?
 
 pub use ironrdp_connector::sspi;
-pub use {tokio, tokio_rustls};
 
 mod macros;
 
@@ -14,32 +13,58 @@ mod clipboard;
 mod display;
 mod echo;
 mod encoder;
+mod error;
 #[cfg(feature = "egfx")]
 mod gfx;
 mod handler;
+pub mod heartbeat;
 #[cfg(feature = "helper")]
 mod helper;
+mod rdpdr;
+mod rdpeai;
+mod rdpei;
 mod server;
 mod sound;
+#[cfg(feature = "usb")]
+mod urbdrc;
 
 pub use clipboard::CliprdrServerFactory;
 pub use display::{
-    BitmapUpdate, ColorPointer, DesktopSize, DisplayUpdate, Framebuffer, PixelFormat, RGBAPointer, RdpServerDisplay,
-    RdpServerDisplayUpdates,
+    BitmapUpdate, ColorPointer, DesktopSize, DisplayUpdate, Framebuffer, LargePointer, PixelFormat, RGBAPointer,
+    RdpServerDisplay, RdpServerDisplayUpdates,
 };
 pub use echo::{EchoDvcBridge, EchoRoundTripMeasurement, EchoServerHandle, EchoServerMessage};
+pub use error::{ServerError, ServerErrorExt, ServerErrorKind, ServerResult, ServerResultExt};
 #[cfg(feature = "egfx")]
 pub use gfx::{EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle};
-pub use handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+pub use handler::{KeyboardEvent, MouseButton, MouseEvent, RdpServerInputHandler};
 #[cfg(feature = "helper")]
 pub use helper::TlsIdentityCtx;
+pub use ironrdp_acceptor::Acceptor;
+pub use ironrdp_pdu::rdp::server_error_info::ErrorInfo;
+pub use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
+#[cfg(feature = "usb")]
+pub use ironrdp_rdpeusb::io::{CompletionData, DeviceAnnounce, DeviceText, InternalIoControlPacket};
+pub use rdpdr::{NoopRdpdrServerBackend, RdpdrServerBackend, RdpdrServerFactory, RdpdrServerMessage};
+pub use rdpeai::{NoopRdpeaiServerBackend, RdpeaiServerBackend, RdpeaiServerFactory, RdpeaiServerMessage};
+pub use rdpei::{
+    CsReadyFlags, CsReadyPdu, DismissHoveringTouchContactPdu, PenContact, PenContactDataFlags, PenContactFields,
+    PenContactFlags, PenEventPdu, PenFlags, PenFrame, RdpInputProtocolVersion, RdpeiHandler, RdpeiServer,
+    RdpeiServerFactory, ScReadyFeatures, TouchContact, TouchContactDataFlags, TouchContactFields, TouchContactFlags,
+    TouchEventPdu, TouchFrame,
+};
 pub use server::{
-    ConnectionHandler, CredentialDecision, CredentialValidationError, CredentialValidator, Credentials,
+    AutoReconnectCookieHandle, ConnectionHandler, ConnectionInfo, ConnectionPolicy, CredentialDecision,
+    CredentialValidationError, CredentialValidator, Credentials, ErrorInfoDisconnectHandle,
     ExactMatchCredentialValidator, PostConnectionAction, RdpServer, RdpServerOptions, RdpServerSecurity, ServerEvent,
-    ServerEventSender, TransportTls,
+    ServerEventSender, StaticChannelFactory, TransportTls, pick_remotefx_entropy_coder,
 };
 pub use sound::{RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
-
+#[cfg(feature = "usb")]
+pub use urbdrc::{
+    CompletionFut, DeviceFactory, PendingHandle, PendingRequest, RdpUsbDeviceAnnounceInfo, UsbDeviceHandle,
+    UsbRedirDevice, UsbRequestCompletion,
+};
 #[cfg(feature = "__bench")]
 pub mod bench {
     pub mod encoder {

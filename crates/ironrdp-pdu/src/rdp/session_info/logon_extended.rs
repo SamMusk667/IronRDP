@@ -1,3 +1,5 @@
+use core::fmt;
+
 use bitflags::bitflags;
 use ironrdp_core::{
     Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, ensure_fixed_part_size,
@@ -43,7 +45,7 @@ impl Encode for LogonInfoExtended {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size());
 
-        dst.write_u16(cast_length!("internalSize", self.get_internal_size())?);
+        dst.write_u16(cast_length!("internalSize", self.get_internal_size(), in: dst)?);
         dst.write_u32(self.present_fields_flags.bits());
 
         if let Some(ref reconnect) = self.auto_reconnect {
@@ -97,11 +99,27 @@ impl<'de> Decode<'de> for LogonInfoExtended {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct ServerAutoReconnect {
     pub logon_id: u32,
     pub random_bits: [u8; AUTO_RECONNECT_RANDOM_BITS_SIZE],
+}
+
+impl fmt::Debug for ServerAutoReconnect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // NOTE: do not show secret (auto-reconnect random).
+        //
+        // These bytes key the HMAC that proves, on reconnect, that this client
+        // was the one last attached to the session ([MS-RDPBCGR] 5.5), so they
+        // are credential material: the spec has the client store the cookie
+        // "in memory, never allowing programmatic access to it". Printing them
+        // would put a live reconnect credential wherever the containing PDU or
+        // event is logged.
+        f.debug_struct("ServerAutoReconnect")
+            .field("logon_id", &self.logon_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ServerAutoReconnect {
@@ -140,12 +158,12 @@ impl<'de> Decode<'de> for ServerAutoReconnect {
         let packet_length = src.read_u32();
         if packet_length != u32::try_from(AUTO_RECONNECT_PACKET_SIZE).expect("AUTO_RECONNECT_PACKET_SIZE fits into u32")
         {
-            return Err(invalid_field_err!("packetLen", "invalid auto-reconnect packet size"));
+            return Err(invalid_field_err!("packetLen", "invalid auto-reconnect packet size", in: src));
         }
 
         let version = src.read_u32();
         if version != AUTO_RECONNECT_VERSION_1 {
-            return Err(invalid_field_err!("version", "invalid auto-reconnect version"));
+            return Err(invalid_field_err!("version", "invalid auto-reconnect version", in: src));
         }
 
         let logon_id = src.read_u32();
@@ -197,7 +215,7 @@ impl<'de> Decode<'de> for LogonErrorsInfo {
 
         let _data_length = src.read_u32();
         let error_type = LogonErrorNotificationType::from_u32(src.read_u32())
-            .ok_or_else(|| invalid_field_err!("errorType", "invalid logon error type"))?;
+            .ok_or_else(|| invalid_field_err!("errorType", "invalid logon error type", in: src))?;
 
         let error_notification_data = src.read_u32();
         let error_data = LogonErrorNotificationDataErrorCode::from_u32(error_notification_data)

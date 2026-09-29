@@ -1,0 +1,54 @@
+## Reviewer pipeline
+
+`review-pipeline.yml` is a reusable GitHub Actions workflow with `workflow_call` as its only trigger.
+The caller limits concurrent pipelines to seven using static lanes, each held for the entire pipeline.
+The caller owns publication.
+
+```text
+evidence -> specialist reviewers running in parallel -> general reviewer aggregating everything
+```
+
+The general reviewer independently inspects the pull request, attempts to falsify every candidate, and records exactly one `accepted`, `refined`, or `rejected` disposition per candidate.
+It can merge overlapping candidates and add findings that no specialist reported.
+Reviewer findings use severity and a question boolean.
+
+- Configure reviewer actions for at most four request retries after the initial attempt.
+- Stream provider responses under idle, byte, and monotonic stage budgets.
+- Keep each provider job alive long enough to persist a bounded stage failure.
+
+### Specialist reviewers
+
+The caller selects specialists and identifies which are required.
+Supported specialists include:
+
+- protocol
+- skeptical
+- code compressor
+
+Run selected specialists in a multi-job matrix, with at most three running at once per pipeline.
+
+### Failure and repair
+
+- Retry transient provider failures only within the logical call that failed.
+- Never restart a reviewer stage or discard its completed conversation.
+- Set the 130-minute reviewer job timeout to cover one stage and cleanup.
+- Produce schema-conforming output with minimal, bounded repair and review-specific semantic validation.
+- Report each rejected output attempt's validation reason with bounded, sanitized diagnostics.
+- Never discard findings during output repair; fail the stage if repair cannot produce valid output.
+
+Reusing results across workflow runs is not required.
+A later run starts fresh.
+
+### Outputs
+
+- Return a validated general review only when every required specialist succeeds.
+- Return every stage's outcome and failure reason, distinguishing reduced coverage from full completion.
+
+Return metrics only for LLM-powered stages, including failed attempts and marking unavailable data:
+
+- Clearly labeled input, output, and total token usage, accumulated across requests.
+- Elapsed time in seconds; label summed durations as cumulative rather than wall-clock time.
+- Request-retry count.
+- Output-repair count.
+
+Count each provider attempt only once.

@@ -24,13 +24,13 @@ use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
-use ironrdp::pdu::rdp::capability_sets::client_codecs_capabilities;
+use ironrdp::pdu::rdp::capability_sets::{BitmapCodecs, client_codecs_capabilities};
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp::rdpdr::Rdpdr;
 use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_PDF_DRIVER_NAME};
 use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
 use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason, fast_path};
+use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp_core::WriteBuf;
 use ironrdp_futures::{FramedWrite, single_sequence_step_read};
 use rgb::AsPixels as _;
@@ -63,6 +63,7 @@ struct SessionBuilderInner {
     proxy_address: Option<String>,
     auth_token: Option<String>,
     pcb: Option<String>,
+    vmconnect: Option<String>,
     kdc_proxy_url: Option<String>,
     client_name: String,
     desktop_size: DesktopSize,
@@ -90,6 +91,8 @@ struct SessionBuilderInner {
 
     use_display_control: bool,
     enable_credssp: bool,
+    enable_server_pointer: bool,
+    legacy_graphics: bool,
     outbound_message_size_limit: Option<usize>,
 }
 
@@ -103,6 +106,7 @@ impl Default for SessionBuilderInner {
             proxy_address: None,
             auth_token: None,
             pcb: None,
+            vmconnect: None,
             kdc_proxy_url: None,
             client_name: "ironrdp-web".to_owned(),
             desktop_size: DesktopSize {
@@ -131,6 +135,8 @@ impl Default for SessionBuilderInner {
 
             use_display_control: false,
             enable_credssp: true,
+            enable_server_pointer: true,
+            legacy_graphics: false,
             outbound_message_size_limit: None,
         }
     }
@@ -245,9 +251,12 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         iron_remote_desktop::extension_match! {
             match ext;
             |pcb: String| { self.0.borrow_mut().pcb = Some(pcb) };
+            |vmconnect: String| { self.0.borrow_mut().vmconnect = Some(vmconnect) };
             |kdc_proxy_url: String| { self.0.borrow_mut().kdc_proxy_url = Some(kdc_proxy_url) };
             |display_control: bool| { self.0.borrow_mut().use_display_control = display_control };
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
+            |enable_server_pointer: bool| { self.0.borrow_mut().enable_server_pointer = enable_server_pointer };
+            |legacy_graphics: bool| { self.0.borrow_mut().legacy_graphics = legacy_graphics };
             |outbound_message_size_limit: f64| {
                 let limit = if outbound_message_size_limit >= 0.0 && outbound_message_size_limit <= f64::from(u32::MAX) {
                     #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -332,6 +341,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             proxy_address,
             auth_token,
             pcb,
+            vmconnect,
             kdc_proxy_url,
             client_name,
             desktop_size,
@@ -353,6 +363,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_device_id,
             printer_driver_name,
             outbound_message_size_limit,
+            legacy_graphics,
         );
 
         {
@@ -365,6 +376,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             proxy_address = inner.proxy_address.clone().context("proxy_address missing")?;
             auth_token = inner.auth_token.clone().context("auth_token missing")?;
             pcb = inner.pcb.clone();
+            vmconnect = inner.vmconnect.clone();
             kdc_proxy_url = inner.kdc_proxy_url.clone();
             client_name = inner.client_name.clone();
             desktop_size = inner.desktop_size;
@@ -394,14 +406,29 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_device_id = inner.printer_device_id;
             printer_driver_name = inner.printer_driver_name.clone();
             outbound_message_size_limit = inner.outbound_message_size_limit;
+            legacy_graphics = inner.legacy_graphics;
+        }
+
+        if pcb.is_some() && vmconnect.is_some() {
+            return Err(anyhow::Error::msg("generic preconnection blob and VMConnect are mutually exclusive").into());
         }
 
         info!("Connect to RDP host");
 
-        let mut config = build_config(username, password, server_domain, client_name.clone(), desktop_size);
+        let mut config = build_config(
+            username,
+            password,
+            server_domain,
+            client_name.clone(),
+            desktop_size,
+            legacy_graphics,
+        );
 
         let enable_credssp = self.0.borrow().enable_credssp;
         config.enable_credssp = enable_credssp;
+
+        let enable_server_pointer = self.0.borrow().enable_server_pointer;
+        config.enable_server_pointer = enable_server_pointer;
 
         let (input_events_tx, input_events_rx) = mpsc::unbounded();
 
@@ -480,6 +507,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             proxy_auth_token: auth_token,
             destination,
             pcb,
+            vmconnect,
             kdc_proxy_url,
             clipboard_backend: clipboard.as_ref().map(|clip| clip.backend()),
             printer_backend,
@@ -1000,6 +1028,15 @@ impl iron_remote_desktop::Session for Session {
                             hotspot_y,
                         })?;
                     }
+                    ActiveStageOutput::MonitorLayout(monitors) => {
+                        debug!(
+                            monitor_count = monitors.len(),
+                            "Received remote monitor layout without multi-monitor support"
+                        );
+                    }
+                    ActiveStageOutput::WindowingOrders(_) => {
+                        // Windowing orders are not meaningful to the protocol-agnostic web component.
+                    }
                     ActiveStageOutput::DeactivateAll => {
                         // Execute the Deactivation-Reactivation Sequence:
                         // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
@@ -1027,27 +1064,27 @@ impl iron_remote_desktop::Session for Session {
                             if let ConnectionActivationState::Finalized {
                                 desktop_size,
                                 share_id,
+                                input_flags: _,
                                 enable_server_pointer,
                                 pointer_software_rendering,
+                                static_channel_chunk_size,
+                                window_support_level,
+                                ..
                             } = connection_activation.connection_activation_state()
                             {
                                 debug!("Deactivation-Reactivation Sequence completed");
                                 image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
-                                // Create a new [`FastPathProcessor`] with potentially updated
-                                // io/user channel ids.
-                                active_stage.set_fastpath_processor(
-                                    fast_path::ProcessorBuilder {
-                                        io_channel_id: connection_activation.io_channel_id(),
-                                        user_channel_id: connection_activation.user_channel_id(),
-                                        share_id,
-                                        enable_server_pointer,
-                                        pointer_software_rendering,
-                                        bulk_decompressor: None,
-                                    }
-                                    .build(),
-                                );
-                                active_stage.set_share_id(share_id);
-                                active_stage.set_enable_server_pointer(enable_server_pointer);
+                                if !active_stage.reactivate(
+                                    connection_activation.io_channel_id(),
+                                    connection_activation.user_channel_id(),
+                                    share_id,
+                                    enable_server_pointer,
+                                    pointer_software_rendering,
+                                    static_channel_chunk_size,
+                                ) {
+                                    return Err(IronError::from(anyhow::anyhow!("invalid static channel chunk size")));
+                                }
+                                active_stage.set_window_support_level(window_support_level);
                                 break 'activation_seq;
                             }
                         }
@@ -1061,6 +1098,18 @@ impl iron_remote_desktop::Session for Session {
                     }
                     ActiveStageOutput::AutoDetect(request) => {
                         debug!(?request, "Auto-detect");
+                    }
+                    ActiveStageOutput::AutoReconnectCookie(_) => {
+                        debug!("Server Auto-Reconnect Cookie received (automatic reconnection not implemented)");
+                    }
+                    ActiveStageOutput::AutoReconnectFailed => {
+                        return Err(anyhow::Error::msg("automatic reconnect rejected by server").into());
+                    }
+                    ActiveStageOutput::SaveSessionInfo { logon_complete: true } => {
+                        debug!("RDP login complete");
+                    }
+                    ActiveStageOutput::SaveSessionInfo { logon_complete: false } => {
+                        debug!("RDP session info notification");
                     }
                     ActiveStageOutput::Terminate(reason) => break 'outer reason,
                 }
@@ -1409,28 +1458,43 @@ fn build_config(
     domain: Option<String>,
     client_name: String,
     desktop_size: DesktopSize,
+    legacy_graphics: bool,
 ) -> connector::Config {
+    // Win7-class servers need 32-bpp lossless bitmaps and no advertised codecs.
+    let bitmap = if legacy_graphics {
+        connector::BitmapConfig {
+            color_depth: 32,
+            lossy_compression: false,
+            codecs: BitmapCodecs(Vec::new()),
+        }
+    } else {
+        connector::BitmapConfig {
+            color_depth: 16,
+            lossy_compression: true,
+            codecs: client_codecs_capabilities(&[]).expect("can't panic for &[]"),
+        }
+    };
+
     connector::Config {
         credentials: Credentials::UsernamePassword { username, password },
         domain,
         // TODO(#327): expose these options from the WASM module.
         enable_tls: true,
         enable_credssp: true,
-        keyboard_type: ironrdp::pdu::gcc::KeyboardType::IbmEnhanced,
+        enable_standard_rdp_security: false,
+        keyboard_type: ironrdp::pdu::gcc::KeyboardType::IBM_ENHANCED,
         keyboard_subtype: 0,
         keyboard_layout: 0, // the server SHOULD use the default active input locale identifier
         keyboard_functional_keys_count: 12,
+        connection_type: ironrdp::pdu::gcc::ConnectionType::Lan,
         ime_file_name: String::new(),
         dig_product_id: String::new(),
         desktop_size: connector::DesktopSize {
             width: desktop_size.width,
             height: desktop_size.height,
         },
-        bitmap: Some(connector::BitmapConfig {
-            color_depth: 16,
-            lossy_compression: true,
-            codecs: client_codecs_capabilities(&[]).expect("can't panic for &[]"),
-        }),
+        monitor_layout: None,
+        bitmap: Some(bitmap),
         #[expect(
             clippy::arithmetic_side_effects,
             reason = "fine unless we end up with an insanely big version"
@@ -1445,12 +1509,14 @@ fn build_config(
         client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
         platform: ironrdp::pdu::rdp::capability_sets::MajorPlatformType::UNSPECIFIED,
         compression_type: None,
-        enable_server_pointer: false,
+        enable_server_pointer: true,
         autologon: false,
         enable_audio_playback: false,
+        enable_audio_capture: false,
         request_data: None,
         pointer_software_rendering: false,
         multitransport_flags: None,
+        support_dyn_vc_gfx_protocol: false,
         performance_flags: PerformanceFlags::default(),
         desktop_scale_factor: 0,
         hardware_id: None,
@@ -1458,6 +1524,8 @@ fn build_config(
         timezone_info: TimezoneInfo::default(),
         alternate_shell: String::new(),
         work_dir: String::new(),
+        remote_application_mode: false,
+        rail_support_level: ironrdp::pdu::rdp::capability_sets::RailSupportLevel::SUPPORTED,
     }
 }
 
@@ -1505,6 +1573,7 @@ struct ConnectParams {
     proxy_auth_token: String,
     destination: String,
     pcb: Option<String>,
+    vmconnect: Option<String>,
     kdc_proxy_url: Option<String>,
     clipboard_backend: Option<WasmClipboardBackend>,
     printer_backend: Option<WasmPrinterBackend>,
@@ -1556,6 +1625,7 @@ async fn connect(
         proxy_auth_token,
         destination,
         pcb,
+        vmconnect,
         kdc_proxy_url,
         clipboard_backend,
         printer_backend,
@@ -1597,24 +1667,40 @@ async fn connect(
         );
     }
 
-    let (upgraded, server_public_key) =
-        connect_rdcleanpath(&mut framed, &mut connector, destination.clone(), proxy_auth_token, pcb).await?;
+    let kerberos_config = url::Url::parse(kdc_proxy_url.unwrap_or_default().as_str())
+        .ok()
+        .map(|url| KerberosConfig {
+            kdc_proxy_url: Some(url),
+            // HACK: It's supposed to be the computer name of the client, but since it's not easy to retrieve this information in the browser,
+            // we set the destination hostname instead because it happens to work.
+            hostname: destination.clone(),
+        });
+
+    let mut network_client = WasmNetworkClient;
+    let server_name = connector::ServerName::from(destination.as_str());
+    let (upgraded, server_public_key) = connect_rdcleanpath(
+        &mut framed,
+        &mut connector,
+        &mut network_client,
+        RDCleanPathConnectParams {
+            server_name: server_name.clone(),
+            destination: destination.clone(),
+            proxy_auth_token,
+            pcb,
+            vmconnect,
+            kerberos_config: kerberos_config.clone(),
+        },
+    )
+    .await?;
 
     let connection_result = ironrdp_futures::connect_finalize(
         upgraded,
         connector,
         &mut framed,
-        &mut WasmNetworkClient,
-        (&destination).into(),
+        &mut network_client,
+        server_name,
         server_public_key,
-        url::Url::parse(kdc_proxy_url.unwrap_or_default().as_str()) // if kdc_proxy_url does not exit, give url parser a empty string, it will fail anyway and map to a None
-            .ok()
-            .map(|url| KerberosConfig {
-                kdc_proxy_url: Some(url),
-                // HACK: It's supposed to be the computer name of the client, but since it's not easy to retrieve this information in the browser,
-                // we set the destination hostname instead because it happens to work.
-                hostname: destination,
-            }),
+        kerberos_config,
     )
     .await?;
 
@@ -1623,15 +1709,24 @@ async fn connect(
     Ok((connection_result, ws))
 }
 
-async fn connect_rdcleanpath<S>(
-    framed: &mut ironrdp_futures::Framed<S>,
-    connector: &mut ClientConnector,
+struct RDCleanPathConnectParams {
+    server_name: connector::ServerName,
     destination: String,
     proxy_auth_token: String,
     pcb: Option<String>,
+    vmconnect: Option<String>,
+    kerberos_config: Option<KerberosConfig>,
+}
+
+async fn connect_rdcleanpath<S, N>(
+    framed: &mut ironrdp_futures::Framed<S>,
+    connector: &mut ClientConnector,
+    network_client: &mut N,
+    params: RDCleanPathConnectParams,
 ) -> Result<(ironrdp_futures::Upgraded, Vec<u8>), IronError>
 where
     S: ironrdp_futures::FramedRead + FramedWrite,
+    N: ironrdp_futures::NetworkClient,
 {
     use ironrdp::connector::Sequence as _;
     use x509_cert::der::Decode as _;
@@ -1654,29 +1749,40 @@ where
         }
     }
 
+    let RDCleanPathConnectParams {
+        server_name,
+        destination,
+        proxy_auth_token,
+        pcb,
+        vmconnect,
+        kerberos_config,
+    } = params;
+    let request_vmconnect = vmconnect.is_some();
+
     let mut buf = WriteBuf::new();
 
     info!("Begin connection procedure");
 
     {
-        // RDCleanPath request
+        let rdcleanpath_req = if let Some(pcb_payload) = vmconnect {
+            ironrdp_rdcleanpath::RDCleanPathPdu::new_vmconnect_request(destination, proxy_auth_token, pcb_payload)
+                .context("build VMConnect RDCleanPath request")?
+        } else {
+            let connector::ClientConnectorState::ConnectionInitiationSendRequest = connector.state else {
+                return Err(anyhow::Error::msg("invalid connector state (send request)").into());
+            };
 
-        let connector::ClientConnectorState::ConnectionInitiationSendRequest = connector.state else {
-            return Err(anyhow::Error::msg("invalid connector state (send request)").into());
-        };
+            debug_assert!(connector.next_pdu_hint().is_none());
 
-        debug_assert!(connector.next_pdu_hint().is_none());
-
-        let written = connector.step_no_input(&mut buf)?;
-        let x224_pdu_len = written.size().expect("written size");
-        debug_assert_eq!(x224_pdu_len, buf.filled_len());
-        let x224_pdu = buf.filled().to_vec();
-
-        let rdcleanpath_req =
+            let written = connector.step_no_input(&mut buf)?;
+            let x224_pdu_len = written.size().expect("written size");
+            debug_assert_eq!(x224_pdu_len, buf.filled_len());
+            let x224_pdu = buf.filled().to_vec();
             ironrdp_rdcleanpath::RDCleanPathPdu::new_request(x224_pdu, destination, proxy_auth_token, pcb)
-                .context("new RDCleanPath request")?;
+                .context("new RDCleanPath request")?
+        };
         debug!(message = ?rdcleanpath_req, "Send RDCleanPath request");
-        let rdcleanpath_req = rdcleanpath_req.to_der().context("RDCleanPath request encode")?;
+        let rdcleanpath_req = rdcleanpath_req.to_der().context("encode RDCleanPath request")?;
 
         framed
             .write_all(&rdcleanpath_req)
@@ -1685,76 +1791,86 @@ where
     }
 
     {
-        // RDCleanPath response
-
         let rdcleanpath_res = framed
             .read_by_hint(&RDCLEANPATH_HINT)
             .await
             .context("read RDCleanPath request")?;
 
         let rdcleanpath_res =
-            ironrdp_rdcleanpath::RDCleanPathPdu::from_der(&rdcleanpath_res).context("RDCleanPath response decode")?;
+            ironrdp_rdcleanpath::RDCleanPathPdu::from_der(&rdcleanpath_res).context("decode RDCleanPath response")?;
 
         debug!(message = ?rdcleanpath_res, "Received RDCleanPath PDU");
 
-        let (x224_connection_response, server_cert_chain) =
-            match rdcleanpath_res.into_enum().context("invalid RDCleanPath PDU")? {
-                ironrdp_rdcleanpath::RDCleanPath::Request { .. } => {
-                    return Err(anyhow::Error::msg("received an unexpected RDCleanPath type (request)").into());
-                }
-                ironrdp_rdcleanpath::RDCleanPath::Response {
+        let (x224_connection_response, server_cert_chain) = match (
+            request_vmconnect,
+            rdcleanpath_res.into_message().context("invalid RDCleanPath PDU")?,
+        ) {
+            (_, ironrdp_rdcleanpath::RDCleanPathMessage::Request { .. })
+            | (_, ironrdp_rdcleanpath::RDCleanPathMessage::VmConnectRequest { .. }) => {
+                return Err(anyhow::Error::msg("received an unexpected RDCleanPath type (request)").into());
+            }
+            (
+                false,
+                ironrdp_rdcleanpath::RDCleanPathMessage::Response {
                     x224_connection_response,
                     server_cert_chain,
                     server_addr: _,
-                } => (x224_connection_response, server_cert_chain),
-                ironrdp_rdcleanpath::RDCleanPath::GeneralErr(error) => {
-                    let details = iron_remote_desktop::RDCleanPathDetails::new(
-                        error.http_status_code,
-                        error.wsa_last_error,
-                        error.tls_alert_code,
-                    );
-                    return Err(
-                        IronError::from(anyhow::Error::new(error).context("received an RDCleanPath error"))
-                            .with_kind(IronErrorKind::RDCleanPath)
-                            .with_rdcleanpath_details(details),
-                    );
-                }
-                ironrdp_rdcleanpath::RDCleanPath::NegotiationErr {
+                },
+            ) => (Some(x224_connection_response), server_cert_chain),
+            (
+                true,
+                ironrdp_rdcleanpath::RDCleanPathMessage::VmConnectResponse {
+                    server_cert_chain,
+                    server_addr: _,
+                },
+            ) => (None, server_cert_chain),
+            (true, ironrdp_rdcleanpath::RDCleanPathMessage::Response { .. }) => {
+                return Err(
+                    anyhow::Error::msg("response from RDCleanPath includes X.224 for a VMConnect request").into(),
+                );
+            }
+            (false, ironrdp_rdcleanpath::RDCleanPathMessage::VmConnectResponse { .. }) => {
+                return Err(
+                    anyhow::Error::msg("response from RDCleanPath is missing X.224 for an ordinary request").into(),
+                );
+            }
+            (_, ironrdp_rdcleanpath::RDCleanPathMessage::GeneralErr(error)) => {
+                let details = iron_remote_desktop::RDCleanPathDetails::new(
+                    error.http_status_code,
+                    error.wsa_last_error,
+                    error.tls_alert_code,
+                );
+                return Err(
+                    IronError::from(anyhow::Error::new(error).context("received an RDCleanPath error"))
+                        .with_kind(IronErrorKind::RDCleanPath)
+                        .with_rdcleanpath_details(details),
+                );
+            }
+            (
+                _,
+                ironrdp_rdcleanpath::RDCleanPathMessage::NegotiationErr {
                     x224_connection_response,
-                } => {
-                    // Try to decode as X.224 Connection Confirm to extract negotiation failure details.
-                    if let Ok(x224_confirm) = ironrdp_core::decode::<
-                        ironrdp::pdu::x224::X224<ironrdp::pdu::nego::ConnectionConfirm>,
-                    >(&x224_connection_response)
-                    {
-                        if let ironrdp::pdu::nego::ConnectionConfirm::Failure { code } = x224_confirm.0 {
-                            // Convert to negotiation failure instead of generic RDCleanPath error.
-                            let negotiation_failure = connector::NegotiationFailure::from(code);
-                            return Err(IronError::from(
-                                anyhow::Error::new(negotiation_failure).context("RDP negotiation failed"),
-                            )
-                            .with_kind(IronErrorKind::NegotiationFailure));
-                        }
+                },
+            ) => {
+                if let Ok(x224_confirm) = ironrdp_core::decode::<
+                    ironrdp::pdu::x224::X224<ironrdp::pdu::nego::ConnectionConfirm>,
+                >(&x224_connection_response)
+                {
+                    if let ironrdp::pdu::nego::ConnectionConfirm::Failure { code } = x224_confirm.0 {
+                        let negotiation_failure = connector::NegotiationFailure::from(code);
+                        return Err(IronError::from(
+                            anyhow::Error::new(negotiation_failure).context("RDP negotiation failed"),
+                        )
+                        .with_kind(IronErrorKind::NegotiationFailure));
                     }
-
-                    // Fallback to generic error if we can't decode the negotiation failure.
-                    return Err(
-                        IronError::from(anyhow::Error::msg("received an RDCleanPath negotiation error"))
-                            .with_kind(IronErrorKind::RDCleanPath),
-                    );
                 }
-            };
 
-        let connector::ClientConnectorState::ConnectionInitiationWaitConfirm { .. } = connector.state else {
-            return Err(anyhow::Error::msg("invalid connector state (wait confirm)").into());
+                return Err(
+                    IronError::from(anyhow::Error::msg("received an RDCleanPath negotiation error"))
+                        .with_kind(IronErrorKind::RDCleanPath),
+                );
+            }
         };
-
-        debug_assert!(connector.next_pdu_hint().is_some());
-
-        buf.clear();
-        let written = connector.step(x224_connection_response.as_bytes(), &mut buf)?;
-
-        debug_assert!(written.is_nothing());
 
         let server_cert = server_cert_chain
             .into_iter()
@@ -1765,18 +1881,40 @@ where
             .context("failed to decode x509 certificate sent by proxy")?;
 
         let server_public_key = cert
-            .tbs_certificate
-            .subject_public_key_info
+            .tbs_certificate()
+            .subject_public_key_info()
             .subject_public_key
             .as_bytes()
             .context("subject public key BIT STRING is not aligned")?
             .to_owned();
 
-        let should_upgrade = ironrdp_futures::skip_connect_begin(connector);
+        let upgraded = match x224_connection_response {
+            Some(x224_connection_response) => {
+                let connector::ClientConnectorState::ConnectionInitiationWaitConfirm { .. } = connector.state else {
+                    return Err(anyhow::Error::msg("invalid connector state (wait confirm)").into());
+                };
 
-        // At this point, proxy established the TLS session.
+                debug_assert!(connector.next_pdu_hint().is_some());
 
-        let upgraded = ironrdp_futures::mark_as_upgraded(should_upgrade, connector);
+                buf.clear();
+                let written = connector.step(x224_connection_response.as_bytes(), None, &mut buf)?;
+                debug_assert!(written.is_nothing());
+
+                let should_upgrade = ironrdp_futures::skip_connect_begin(connector);
+                ironrdp_futures::mark_as_upgraded(should_upgrade, connector)
+            }
+            None => ironrdp_vmconnect::connect_front(
+                ironrdp_vmconnect::pcb_sent_via_proxy(),
+                framed,
+                connector,
+                network_client,
+                server_name,
+                &server_public_key,
+                kerberos_config,
+            )
+            .await
+            .context("connect Hyper-V front over RDCleanPath")?,
+        };
 
         Ok((upgraded, server_public_key))
     }

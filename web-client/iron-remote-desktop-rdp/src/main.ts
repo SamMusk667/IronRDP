@@ -30,6 +30,17 @@ export function preConnectionBlob(pcb: string): Extension {
     return new Extension('pcb', pcb);
 }
 
+export type VmConnectMode = 'enhanced' | 'basic';
+
+export function vmConnect(vmId: string, mode: VmConnectMode = 'enhanced'): Extension {
+    if (vmId.trim() === '') {
+        throw new Error('vmconnect requires a VM ID');
+    }
+
+    const payload = mode === 'enhanced' ? `${vmId};EnhancedMode=1` : vmId;
+    return new Extension('vmconnect', payload);
+}
+
 export function displayControl(enable: boolean): Extension {
     return new Extension('display_control', enable);
 }
@@ -44,6 +55,14 @@ export function outboundMessageSizeLimit(limit: number): Extension {
 
 export function enableCredssp(enable: boolean): Extension {
     return new Extension('enable_credssp', enable);
+}
+
+export function enableServerPointer(enable: boolean): Extension {
+    return new Extension('enable_server_pointer', enable);
+}
+
+export function legacyGraphics(enable: boolean): Extension {
+    return new Extension('legacy_graphics', enable);
 }
 
 // --- File transfer (RDP-specific) ---

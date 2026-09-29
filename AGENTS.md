@@ -128,7 +128,7 @@ Do not modify them unless specifically working on fixing their compilation.
 ## Coding Standards (The "Gold Standard")
 
 - **Language:** Rust (Edition 2024; toolchain pinned via `rust-toolchain.toml`)
-- **Toolchain baseline:** Rust `1.89.0`
+- **Toolchain baseline:** Rust `1.94.1`
 - **Formatter:** `rustfmt` (workspace config in `rustfmt.toml`)
 - **Lints:** Strict workspace lint policy (`[workspace.lints.rust]` and `[workspace.lints.clippy]` in root `Cargo.toml`)
 - **Error handling:** Prefer explicit, composable error messages following `STYLE.md`
@@ -137,12 +137,15 @@ Do not modify them unless specifically working on fixing their compilation.
 ### Key Style Conventions (from `STYLE.md`)
 
 - **Error messages:** lowercase, no trailing punctuation, use `crate_name::Result` (e.g., `anyhow::Result`) not bare `Result`.
+- **Error construction:** use the `*_err!` macros with `in: src` so byte offsets are captured; reserve the offset-less `Other` kind for non-stream failures. No `thiserror` in core-tier crates.
+- **Unknown wire values:** retain unknown advertisement bits (`from_bits_retain`); stay strict only for negotiation outputs the receiver must implement and for structural discriminants. See STYLE.md "Decoding unknown values".
 - **Log messages:** capitalize first letter, no trailing period, use structured tracing fields (`info!(%server_addr, "Looked up server address")`).
 - **Size constants:** annotate each addend with an inline comment naming the field (e.g., `1 /* Version */ + 2 /* Length */`).
 - **Invariants:** define with `INVARIANT:` prefix in comments; state positively; prefer `<`/`<=` over `>`/`>=`.
 - **Doc comments:** link to spec sections using reference-style links.
 - **Avoid monomorphization:** use `&dyn` inner functions for large generic code; avoid `AsRef` polymorphism.
 - **No single-use helper functions:** use blocks instead; put nested helpers at end of enclosing function.
+- **Inline test modules:** place `#[cfg(test)] mod tests` (and other test-only modules) at the end of their enclosing source file or module, after all production items. Do not interleave them with normal source code.
 
 ### Dependency Policies
 

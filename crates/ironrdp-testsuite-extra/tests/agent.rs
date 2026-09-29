@@ -1,18 +1,22 @@
-//! Codec round-trip tests for the `ironrdp-agent` IPC and wire protocols.
+//! Codec round-trip tests for the shared RPC protocol and daemon NOW endpoint.
 //!
-//! These exercise the crate's private wire format through its public (and `internal`-feature)
-//! API. They live here, in the shared test suite, rather than inside `ironrdp-agent` itself, per
+//! These exercise the reusable protocol and daemon support. They live here, in the shared test
+//! suite, rather than inside the owning crates themselves, per
 //! the workspace convention of keeping unit tests for protocol codecs in `ironrdp-testsuite-extra`.
 
 use core::fmt::Debug;
 
-use ironrdp_agent::ipc::{
-    ConnState, KeyFilter, Payload, PropValue, PropertyDump, PropertyEntry, Request, Response, StatusInfo,
-};
-use ironrdp_agent::wire;
 use ironrdp_core::{Decode, DecodeOwned, Encode, decode, decode_owned, encode_vec};
+use ironrdp_daemon::now::{DVC_CHANNEL_NAME, INITIAL_ENDPOINT_TIMEOUT, NowEndpoint, RECONNECT_ENDPOINT_TIMEOUT};
 use ironrdp_input::MouseButton;
 use ironrdp_propertyset::PropertySet;
+use ironrdp_rpc::ipc::{
+    AgentError, AgentErrorCategory, ClipboardFileEntry, ConnState, KeyFilter, NowCapabilities, NowDiagnostics,
+    NowExecutionKind, NowExecutionRequest, NowStream, OperationEvent, OperationEventKind, OperationInfo,
+    OperationState, Payload, PropValue, PropertyDump, PropertyEntry, RailEvent, RailEventDump, RailEventKind,
+    RailExecuteFailureReason, RailExecuteRequest, RailLaunchInfo, RailStatusInfo, Request, Response, StatusInfo,
+};
+use ironrdp_rpc::wire;
 
 #[track_caller]
 fn round_trip<T>(value: &T)
@@ -81,6 +85,101 @@ fn request_variants_round_trip() {
             ch: '\u{00e9}',
             pressed: true,
         },
+        Request::UnicodeText {
+            text: "Hello, \u{4e16}\u{754c}".to_owned(),
+        },
+        Request::Touch {
+            encode_time: 12,
+            frames: vec![ironrdp_rpc::ipc::TouchFrameRequest {
+                frame_offset: 0,
+                contacts: vec![ironrdp_rpc::ipc::TouchContactRequest {
+                    contact_id: 1,
+                    x: 100,
+                    y: 200,
+                    flags: 0x0019, // DOWN | INRANGE | INCONTACT
+                }],
+            }],
+        },
+        Request::Pen {
+            encode_time: 24,
+            frames: vec![ironrdp_rpc::ipc::PenFrameRequest {
+                frame_offset: 0,
+                contacts: vec![ironrdp_rpc::ipc::PenContactRequest {
+                    device_id: 0,
+                    x: 300,
+                    y: 400,
+                    flags: 0x0019, // DOWN | INRANGE | INCONTACT
+                    pressure: Some(512),
+                    rotation: Some(45),
+                    tilt_x: Some(10),
+                    tilt_y: Some(-5),
+                    pen_flags: None,
+                }],
+            }],
+        },
+        Request::DismissHoveringTouchContact { contact_id: 3 },
+        Request::NowCapabilities,
+        Request::NowRun {
+            command: "echo secret".to_owned(),
+            directory: Some("C:\\Temp".to_owned()),
+        },
+        Request::NowExecute(NowExecutionRequest {
+            kind: NowExecutionKind::PowerShell,
+            command: "$env:SECRET".to_owned(),
+            parameters: None,
+            directory: None,
+            stdin: Some(vec![0, 0xFF]),
+            timeout_ms: Some(3_000),
+            detached: false,
+            no_profile: true,
+            non_interactive: true,
+        }),
+        Request::NowCancel { operation_id: 42 },
+        Request::NowList,
+        Request::NowStatus { operation_id: 42 },
+        Request::NowAttach {
+            operation_id: 42,
+            after_sequence: Some(7),
+        },
+        Request::NowStdin {
+            operation_id: 42,
+            data: vec![0, 0xFF],
+            last: true,
+        },
+        Request::NowDiagnostics,
+        Request::RailStatus,
+        Request::RailEvents {
+            after_sequence: Some(7),
+        },
+        Request::RailWait {
+            after_sequence: Some(7),
+            timeout_ms: 1_000,
+        },
+        Request::RailExecute(RailExecuteRequest {
+            executable: "notepad.exe".to_owned(),
+            working_directory: "C:\\Temp".to_owned(),
+            arguments: "audit.txt".to_owned(),
+            flags: 0,
+        }),
+        Request::ClipboardGet,
+        Request::ClipboardSet {
+            text: "clipboard text".to_owned(),
+        },
+        Request::ClipboardGetImage,
+        Request::ClipboardSetImage {
+            png: vec![0x89, b'P', b'N', b'G', 0, 0xFF],
+        },
+        Request::ClipboardGetHtml,
+        Request::ClipboardSetHtml {
+            html: "<b>clipboard html</b>".to_owned(),
+        },
+        Request::ClipboardSetFiles {
+            paths: vec!["/home/user/report.pdf".to_owned(), "/home/user/photo.jpg".to_owned()],
+        },
+        Request::ClipboardSetFiles { paths: vec![] },
+        Request::ClipboardListFiles,
+        Request::ClipboardGetFile { index: 0 },
+        Request::ClipboardGetFile { index: -1 },
     ];
 
     for request in &requests {
@@ -128,6 +227,129 @@ fn response_variants_round_trip() {
             png: vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
         }),
         Response::Ok(Payload::Empty),
+        Response::Err(AgentError {
+            category: AgentErrorCategory::Remote,
+            message: "remote command failed".to_owned(),
+        }),
+        Response::Ok(Payload::NowCapabilities(NowCapabilities {
+            version_major: 1,
+            version_minor: 4,
+            heartbeat_ms: Some(60_000),
+            run: true,
+            process: true,
+            batch: true,
+            powershell: true,
+            pwsh: true,
+            io_redirection: true,
+            unicode_console: true,
+        })),
+        Response::Ok(Payload::NowOperation(OperationInfo {
+            id: 7,
+            kind: NowExecutionKind::Batch,
+            state: OperationState::Completed,
+            detached: false,
+            exit_code: Some(17),
+            error: None,
+            retained_output_bytes: 3,
+            next_sequence: 2,
+        })),
+        Response::Ok(Payload::NowOperations(vec![OperationInfo {
+            id: 8,
+            kind: NowExecutionKind::Process,
+            state: OperationState::Failed,
+            detached: false,
+            exit_code: None,
+            error: Some(AgentError {
+                category: AgentErrorCategory::Transport,
+                message: "now worker closed".to_owned(),
+            }),
+            retained_output_bytes: 0,
+            next_sequence: 1,
+        }])),
+        Response::Ok(Payload::NowEvent(OperationEvent {
+            operation_id: 7,
+            sequence: 1,
+            kind: OperationEventKind::Output {
+                stream: NowStream::Stderr,
+                data: vec![0, 0xFF],
+                last: true,
+            },
+        })),
+        Response::Ok(Payload::NowDiagnostics(NowDiagnostics {
+            endpoint_allocated: true,
+            connected: false,
+            capabilities: None,
+        })),
+        Response::Ok(Payload::RailStatus(RailStatusInfo {
+            generation: 9,
+            next_sequence: 4,
+            handshake_complete: true,
+            desktop_synchronized: false,
+            pending_launches: vec![RailLaunchInfo {
+                launch_id: 3,
+                executable: "notepad.exe".to_owned(),
+                flags: 0,
+            }],
+        })),
+        Response::Ok(Payload::RailEvents(RailEventDump {
+            generation: 9,
+            events: vec![
+                RailEvent {
+                    sequence: 1,
+                    kind: RailEventKind::Gap { lost_through: 4 },
+                },
+                RailEvent {
+                    sequence: 5,
+                    kind: RailEventKind::ExecuteResult {
+                        launch_id: Some(3),
+                        executable: "notepad.exe".to_owned(),
+                        flags: 0,
+                        result: 0,
+                        raw_result: 0,
+                    },
+                },
+                RailEvent {
+                    sequence: 6,
+                    kind: RailEventKind::ExecuteFailed {
+                        launch_id: Some(3),
+                        executable: "notepad.exe".to_owned(),
+                        flags: 0,
+                        reason: RailExecuteFailureReason::QueueRejected,
+                    },
+                },
+            ],
+        })),
+        Response::Ok(Payload::RailLaunch(RailLaunchInfo {
+            launch_id: 3,
+            executable: "notepad.exe".to_owned(),
+            flags: 0,
+        })),
+        Response::Ok(Payload::ClipboardText(None)),
+        Response::Ok(Payload::ClipboardText(Some("clipboard text".to_owned()))),
+        Response::Ok(Payload::ClipboardImage(None)),
+        Response::Ok(Payload::ClipboardImage(Some(vec![0x89, b'P', b'N', b'G', 0, 0xFF]))),
+        Response::Ok(Payload::ClipboardHtml(None)),
+        Response::Ok(Payload::ClipboardHtml(Some("<b>clipboard html</b>".to_owned()))),
+        Response::Ok(Payload::ClipboardFileList(None)),
+        Response::Ok(Payload::ClipboardFileList(Some(vec![]))),
+        Response::Ok(Payload::ClipboardFileList(Some(vec![
+            ClipboardFileEntry {
+                name: "report.pdf".to_owned(),
+                relative_path: None,
+                is_directory: false,
+                size: Some(4096),
+                last_write_time: Some(133_500_000_000_000_000),
+            },
+            ClipboardFileEntry {
+                name: "subdir".to_owned(),
+                relative_path: Some("folder".to_owned()),
+                is_directory: true,
+                size: None,
+                last_write_time: None,
+            },
+        ]))),
+        Response::Ok(Payload::ClipboardFile(vec![])),
+        Response::Ok(Payload::ClipboardFile(vec![1, 2, 3, 4, 5])),
     ];
 
     for response in &responses {
@@ -173,4 +395,111 @@ fn bytes_wire_round_trips() {
     let mut read_cursor = ironrdp_core::ReadCursor::new(&buf);
     let decoded = wire::read_bytes(&mut read_cursor).expect("read_bytes");
     assert_eq!(original, decoded, "bytes wire round-trip mismatch");
+}
+
+#[test]
+fn opt_bytes_wire_round_trips() {
+    for original in [None, Some(vec![0x89, b'P', b'N', b'G', 0x00, 0xFF])] {
+        let size = wire::opt_bytes_size(original.as_deref());
+        let mut buf = vec![0u8; size];
+        let mut cursor = ironrdp_core::WriteCursor::new(&mut buf);
+        wire::write_opt_bytes(&mut cursor, original.as_deref()).expect("write_opt_bytes");
+        assert_eq!(cursor.pos(), size, "written length must match computed size");
+
+        let mut read_cursor = ironrdp_core::ReadCursor::new(&buf);
+        let decoded = wire::read_opt_bytes(&mut read_cursor).expect("read_opt_bytes");
+        assert_eq!(original, decoded, "optional bytes wire round-trip mismatch");
+    }
+}
+
+#[test]
+fn clipboard_debug_redacts_content() {
+    let request = Request::ClipboardSet {
+        text: "secret-text".to_owned(),
+    };
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("secret-text"));
+
+    let payload = Payload::ClipboardText(Some("secret-text".to_owned()));
+    let debug = format!("{payload:?}");
+    assert!(!debug.contains("secret-text"));
+
+    let request = Request::ClipboardSetImage {
+        png: b"secret-pixels".to_vec(),
+    };
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("secret-pixels"));
+
+    let payload = Payload::ClipboardImage(Some(b"secret-pixels".to_vec()));
+    let debug = format!("{payload:?}");
+    assert!(!debug.contains("secret-pixels"));
+
+    let request = Request::ClipboardSetHtml {
+        html: "<b>secret-markup</b>".to_owned(),
+    };
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("secret-markup"));
+
+    let payload = Payload::ClipboardHtml(Some("<b>secret-markup</b>".to_owned()));
+    let debug = format!("{payload:?}");
+    assert!(!debug.contains("secret-markup"));
+
+    let request = Request::ClipboardSetFiles {
+        paths: vec!["/home/user/secret-plans.pdf".to_owned()],
+    };
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("secret-plans"));
+
+    let payload = Payload::ClipboardFileList(Some(vec![ClipboardFileEntry {
+        name: "secret-plans.pdf".to_owned(),
+        relative_path: None,
+        is_directory: false,
+        size: Some(1),
+        last_write_time: None,
+    }]));
+    let debug = format!("{payload:?}");
+    assert!(!debug.contains("secret-plans"));
+
+    let payload = Payload::ClipboardFile(b"secret-file-bytes".to_vec());
+    let debug = format!("{payload:?}");
+    assert!(!debug.contains("secret-file-bytes"));
+}
+
+#[test]
+fn now_request_debug_redacts_command_and_stdin() {
+    let request = Request::NowExecute(NowExecutionRequest {
+        kind: NowExecutionKind::Batch,
+        command: "secret-command".to_owned(),
+        parameters: None,
+        directory: None,
+        stdin: Some(b"secret-stdin".to_vec()),
+        timeout_ms: None,
+        detached: false,
+        no_profile: false,
+        non_interactive: false,
+    });
+
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("secret-command"));
+    assert!(!debug.contains("secret-stdin"));
+}
+
+#[test]
+fn remote_exit_codes_follow_the_cli_contract() {
+    assert_eq!(ironrdp_agent::cli::remote_exit_status(0), 0);
+    assert_eq!(ironrdp_agent::cli::remote_exit_status(1), 1);
+    assert_eq!(ironrdp_agent::cli::remote_exit_status(255), 255);
+    assert_eq!(ironrdp_agent::cli::remote_exit_status(256), 255);
+    assert_eq!(ironrdp_agent::cli::remote_exit_status(u32::MAX), 255);
+}
+
+#[test]
+fn now_endpoint_is_per_session_and_uses_documented_deadlines() {
+    let first = NowEndpoint::new().expect("endpoint allocation must succeed");
+    let second = NowEndpoint::new().expect("endpoint allocation must succeed");
+
+    assert_ne!(first.pipe_name(), second.pipe_name());
+    assert_eq!(first.dvc_proxy_info().channel_name, DVC_CHANNEL_NAME);
+    assert_eq!(INITIAL_ENDPOINT_TIMEOUT.as_secs(), 30);
+    assert_eq!(RECONNECT_ENDPOINT_TIMEOUT.as_secs(), 10);
 }
