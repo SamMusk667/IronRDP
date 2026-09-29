@@ -1860,6 +1860,19 @@ fn device_announce_accepts_and_rejects_per_backend_decision() {
 }
 
 #[test]
+fn backend_can_tell_drives_from_other_devices() {
+    let mut devices = Devices::new();
+    devices.add_drive(1, "C".to_owned());
+    devices.add_smartcard(2);
+    let types: Vec<(u32, DeviceType)> = devices
+        .clone_inner()
+        .iter()
+        .map(|device| (device.device_id(), device.device_type()))
+        .collect();
+    assert_eq!(types, [(1, DeviceType::Filesystem), (2, DeviceType::Smartcard)]);
+}
+
+#[test]
 fn device_list_remove_notifies_backend() {
     let mut server = RdpdrServer::new(Box::new(TrackingServerBackend::default()));
     handshake_to_active(&mut server);

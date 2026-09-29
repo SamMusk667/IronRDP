@@ -1331,7 +1331,8 @@ impl DeviceAnnounceHeader {
         }
     }
 
-    pub(crate) fn device_type(&self) -> DeviceType {
+    /// The kind of device: a server backend accepts the kinds it serves and declines the rest.
+    pub fn device_type(&self) -> DeviceType {
         self.device_type
     }
 
