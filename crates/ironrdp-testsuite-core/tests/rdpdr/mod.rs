@@ -1873,6 +1873,19 @@ fn backend_can_tell_drives_from_other_devices() {
 }
 
 #[test]
+fn drive_failure_statuses_have_their_codes_and_names() {
+    for (status, code, name) in [
+        (NtStatus::NO_SUCH_DEVICE, 0xC000_000E, "STATUS_NO_SUCH_DEVICE"),
+        (NtStatus::OBJECT_NAME_NOT_FOUND, 0xC000_0034, "STATUS_OBJECT_NAME_NOT_FOUND"),
+        (NtStatus::NAME_TOO_LONG, 0xC000_0106, "STATUS_NAME_TOO_LONG"),
+        (NtStatus::CANNOT_DELETE, 0xC000_0121, "STATUS_CANNOT_DELETE"),
+    ] {
+        assert_eq!(u32::from(status), code);
+        assert_eq!(format!("{status:?}"), name);
+    }
+}
+
+#[test]
 fn device_list_remove_notifies_backend() {
     let mut server = RdpdrServer::new(Box::new(TrackingServerBackend::default()));
     handshake_to_active(&mut server);

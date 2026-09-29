@@ -1599,6 +1599,14 @@ impl NtStatus {
     pub const DELETE_PENDING: Self = Self(0xC000_0056);
     /// STATUS_MEDIA_WRITE_PROTECTED
     pub const MEDIA_WRITE_PROTECTED: Self = Self(0xC000_00A2);
+    /// STATUS_NO_SUCH_DEVICE
+    pub const NO_SUCH_DEVICE: Self = Self(0xC000_000E);
+    /// STATUS_OBJECT_NAME_NOT_FOUND
+    pub const OBJECT_NAME_NOT_FOUND: Self = Self(0xC000_0034);
+    /// STATUS_NAME_TOO_LONG
+    pub const NAME_TOO_LONG: Self = Self(0xC000_0106);
+    /// STATUS_CANNOT_DELETE
+    pub const CANNOT_DELETE: Self = Self(0xC000_0121);
 }
 
 impl Debug for NtStatus {
@@ -1630,6 +1638,10 @@ impl Debug for NtStatus {
             NtStatus::CANCELLED => write!(f, "STATUS_CANCELLED"),
             NtStatus::DELETE_PENDING => write!(f, "STATUS_DELETE_PENDING"),
             NtStatus::MEDIA_WRITE_PROTECTED => write!(f, "STATUS_MEDIA_WRITE_PROTECTED"),
+            NtStatus::NO_SUCH_DEVICE => write!(f, "STATUS_NO_SUCH_DEVICE"),
+            NtStatus::OBJECT_NAME_NOT_FOUND => write!(f, "STATUS_OBJECT_NAME_NOT_FOUND"),
+            NtStatus::NAME_TOO_LONG => write!(f, "STATUS_NAME_TOO_LONG"),
+            NtStatus::CANNOT_DELETE => write!(f, "STATUS_CANNOT_DELETE"),
             _ => write!(f, "NtStatus({:#010X})", self.0),
         }
     }
