@@ -693,10 +693,13 @@ impl RdpdrServer {
     /// Opens or creates a file on a client-redirected drive.
     ///
     /// `file_attributes` is fixed at none (the client applies its own defaults) and
-    /// `shared_access` at [`SharedAccess::all`] (don't lock out other opens). Neither
-    /// is caller-configurable yet: covering that would mean widening this method's
+    /// `shared_access` at read, write and delete sharing (don't lock out other opens).
+    /// Neither is caller-configurable yet: covering that would mean widening this method's
     /// signature or exposing the internal request-building path, and no embedder has
     /// needed it so far.
+    ///
+    /// Not [`SharedAccess::all`]: the type keeps unknown bits, so `all()` sets all 32 of
+    /// them, and Windows clients refuse such a share mode with `STATUS_INVALID_PARAMETER`.
     pub fn drive_create(
         &mut self,
         device_id: u32,
@@ -717,7 +720,9 @@ impl RdpdrServer {
             desired_access,
             allocation_size: 0,
             file_attributes: FileAttributes::empty(),
-            shared_access: SharedAccess::all(),
+            shared_access: SharedAccess::FILE_SHARE_READ
+                | SharedAccess::FILE_SHARE_WRITE
+                | SharedAccess::FILE_SHARE_DELETE,
             create_disposition,
             create_options,
             path,

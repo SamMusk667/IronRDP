@@ -1748,6 +1748,25 @@ fn full_handshake_reaches_active_state() {
 }
 
 #[test]
+fn drive_create_shares_read_write_and_delete_only() {
+    let mut server = RdpdrServer::new(Box::new(TrackingServerBackend::default()));
+    handshake_to_active(&mut server);
+    let sent = server
+        .drive_create(
+            1,
+            "\\a.txt",
+            DesiredAccess::FILE_READ_ATTRIBUTES,
+            CreateDisposition::FILE_OPEN,
+            CreateOptions::empty(),
+        )
+        .unwrap();
+    let bytes = sent[0].encode_unframed_pdu().unwrap();
+    // After SharedHeader (4), DeviceIoRequest (20), DesiredAccess (4), AllocationSize (8) and
+    // FileAttributes (4). Windows refuses any other bit with STATUS_INVALID_PARAMETER.
+    assert_eq!(read_u32(&bytes[40..]), 0x7);
+}
+
+#[test]
 fn backend_learns_the_completion_id_of_each_request_in_order() {
     let mut server = RdpdrServer::new(Box::new(TrackingServerBackend::default()));
     handshake_to_active(&mut server);
