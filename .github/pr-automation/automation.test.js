@@ -11,18 +11,24 @@ const { SIZE_LABELS, addedLinesByPath, analyzeFiles, parseLabelerRules } = requi
 const { SCHEMA_VERSION: CLASSIFIER_SCHEMA_VERSION, validateClassifier } = require("./validate-classifier");
 const { validateCandidateReview } = require("./validate-candidate-review");
 const {
-  provenancePrefix, validateFinalReview, validateNormalizedFinalReview,
+  MAXIMUM_DETAIL_BYTES, MAXIMUM_GUIDANCE_BYTES, candidateIndexPrompt, provenancePrefix,
+  validateFinalReview, validateNormalizedFinalReview,
 } = require("./validate-final-review");
 const { buildSpecialistAggregate, validateReviewGate, validateSpecialistRun } = require("./review-pipeline");
 const { resolveReviewerRoute, validateReviewerRoute } = require("./routing");
 const {
-  resolveClassificationState, resolveReviewState, reviewOutcome, reviewPolicyEligible, OVERLAP_MARKER,
+  ACTOR_LABELS, FAILURE_LABEL, resolveClassificationState, resolveReviewState,
+  reviewOutcome, reviewPolicyEligible, OVERLAP_MARKER,
   OVERLAP_LABEL,
   EVIDENCE_LIMIT_MARKER, LEGACY_XL_MARKER, LEGITIMACY_LABEL,
   LEGITIMACY_MARKER_PREFIX, OVERSIZED_MARKER, OVERSIZED_REVIEW_LABEL, contributorEligibility,
 } = require("./resolve-state");
 const { resolvePr } = require("./resolve-pr");
 const { resolveClassificationGate } = require("./classification-gate");
+const { latestExactHeadCiRun, readLatestExactHeadCiRun } = require("./ci-state");
+const {
+  claimAutomaticLease, leaseMarker, parseLeaseMarker, recheckAutomaticReview,
+} = require("./automation-lease");
 const {
   StalePolicyError, applyLabels, escapeMarkdown, markerBody, writeState,
 } = require("./write-state");
@@ -56,6 +62,11 @@ const {
 
 const SHA = "a".repeat(40);
 const OTHER_SHA = "b".repeat(40);
+
+function desiredLabels(state, owned) {
+  return state.labelSets.find((set) => set.owned.includes(owned)).desired;
+}
+
 const classifier = (changes = {}) => ({
   head_sha: SHA, risk: "low", technical_debt: false, documentation_only: false,
   cross_cutting: false,
@@ -408,7 +419,14 @@ function reviewGateScript(workflow = readWorkflow()) {
 async function runReviewGateScript({
   force = false, route = "classification-complete", classificationRuns = [], labels = [],
   author = { type: "User", login: "member", nodeId: "U_1", association: "MEMBER" },
+  workflowRuns = [{ id: 1, run_attempt: 1, name: "CI", head_sha: SHA, conclusion: "success" }],
+  workflowRunPages = [workflowRuns],
+  classificationRunPages = [classificationRuns],
+  reviewRuns = [],
+  reviewRunPages = [reviewRuns],
+  observedRun = null,
 } = {}) {
+  let workflowRunPolls = 0;
   const outputs = new Map();
   const failures = [];
   const core = {
@@ -417,31 +435,52 @@ async function runReviewGateScript({
     info: () => {},
     warning: () => {},
   };
+  const listCheckRuns = () => {};
   const github = {
+    paginate: { iterator: async function* (method, parameters) {
+      if (method === github.rest.actions.listWorkflowRunsForRepo) {
+        workflowRunPolls += 1;
+        for (const page of workflowRunPages) yield { data: page };
+      }
+      if (method === listCheckRuns) {
+        const pages = parameters.check_name === "AI classification"
+          ? classificationRunPages
+          : reviewRunPages;
+        for (const page of pages) yield { data: page };
+      }
+    } },
     rest: {
       checks: {
-        listForRef: async () => ({ data: { check_runs: classificationRuns } }),
+        listForRef: listCheckRuns,
       },
       issues: {
         get: async () => ({ data: { labels: labels.map((name) => ({ name })) } }),
       },
       actions: {
-        listWorkflowRunsForRepo: async () => ({ data: {
-          workflow_runs: [{ name: "CI", conclusion: "success" }],
-        } }),
+        listWorkflowRunsForRepo: () => {},
       },
     },
   };
-  const context = { repo: { owner: "Devolutions", repo: "IronRDP" } };
+  const context = {
+    repo: { owner: "Devolutions", repo: "IronRDP" },
+    payload: { workflow_run: workflowRuns[0] },
+  };
   const process = { env: {
     PULL_REQUEST_NUMBER: "1", HEAD_SHA: SHA, FORCE: String(force),
     LABELS: JSON.stringify(labels), AUTHOR: JSON.stringify(author), ROUTE: route,
+    OBSERVED_CI_RUN: observedRun ? JSON.stringify(observedRun) : "",
   } };
   const rootRequire = createRequire(path.join(__dirname, "..", "..", "labeler.js"));
+  const ciState = rootRequire("./.github/pr-automation/ci-state");
+  const requireWithFastCi = (name) => name === "./.github/pr-automation/ci-state"
+    ? { ...ciState, readLatestExactHeadCiRun: (options) => ciState.readLatestExactHeadCiRun({ delayMs: 0, ...options }) }
+    : rootRequire(name);
   await new AsyncFunction("core", "github", "context", "require", "process", reviewGateScript())(
-    core, github, context, rootRequire, process,
+    core, github, context, requireWithFastCi, process,
   );
-  return { gate: JSON.parse(outputs.get("gate")), eligible: outputs.get("eligible"), failures };
+  return {
+    gate: JSON.parse(outputs.get("gate")), eligible: outputs.get("eligible"), failures, workflowRunPolls,
+  };
 }
 
 async function runResolveReviewScript({ report, pipelineResult = "success" }) {
@@ -555,10 +594,12 @@ test("automatic review requires exact-head CI and only reruns after a later push
   assert.match(classifier, /timeout-minutes: 40/);
   assert.match(reviewGate, /ref: headSha/);
   assert.match(reviewGate, /head_sha: headSha/);
+  assert.match(reviewGate, /readLatestExactHeadCiRun/);
+  assert.match(reviewGate, /const ciGeneration = generation\(latestCiRun\)/);
+  assert.match(reviewGate, /ciRunId: ciGeneration\?\.id \?\? null/);
+  assert.match(workflowJob(workflow, "write-state"), /actions: read/);
   assert.match(reviewGate,
-    /workflowRuns\.some\(\(run\) => run\?\.name === "CI" && run\?\.conclusion === "success"\)/);
-  assert.match(reviewGate,
-    /run\.conclusion === "success" && run\.app\?\.slug === "github-actions"/);
+    /run\.external_id === headSha && run\.conclusion === "success" &&[\s\S]*run\.app\?\.slug === "github-actions"/);
   assert.match(reviewGate, /const secondReviewEligible = !labels\.includes\("ai-reviewed\/1"\) \|\| !reviewAtHead/);
   assert.match(reviewGate,
     /ok: classificationCheck && ciGreen && secondReviewEligible && policyEligible/);
@@ -596,6 +637,20 @@ test("automatic review requires exact-head CI and only reruns after a later push
   assert.match(reviewState,
     /SUMMARY_URL: \$\{\{ github\.server_url \}\}\/\$\{\{ github\.repository \}\}\/actions\/runs\/\$\{\{ github\.run_id \}\}/);
   assert.match(reviewState, /addHeading\("Automated review skipped"\)/);
+  assert.match(reviewState, /reviewAttempted: \["success", "failure"\]\.includes/);
+  assert.match(workflow, /types: \[completed\]/);
+  assert.doesNotMatch(workflow, /types: \[requested, in_progress, completed\]|converted_to_draft|reconcile-lifecycle/);
+});
+
+test("workflow cancellation retains the established event and label groups", () => {
+  const workflow = readWorkflow();
+  const concurrency = workflow.slice(workflow.indexOf("\nconcurrency:"), workflow.indexOf("\npermissions:"));
+  assert.match(concurrency, /github\.event_name/);
+  assert.match(concurrency, /github\.event\.workflow_run\.head_sha/);
+  assert.match(concurrency, /github\.event\.pull_request\.number/);
+  assert.match(concurrency, /github\.event\.label\.name == 'ai-review\/allow-oversized' && 'pr'/);
+  assert.doesNotMatch(concurrency, /lifecycle|ci-completion|dispatch-review|manual-/);
+  assert.match(concurrency, /cancel-in-progress: true/);
 });
 
 test("review skip summary lists every failed gate condition", () => {
@@ -618,7 +673,7 @@ test("review skip summary lists every failed gate condition", () => {
     "CI has not succeeded for this head.",
     "An automated review has already run for this head; push a new commit before the next review.",
     "The pull request has reached the two-review limit.",
-    "The pull request requires a maintainer legitimacy decision.",
+    "The pull request is awaiting its green exact-head CI handoff for legitimacy triage.",
     "The pull request was opened by a bot account.",
   ]);
 });
@@ -629,7 +684,7 @@ test("manual reviews with no valid classification fail as invocation errors", as
     assert.deepEqual(result.gate, {
       ok: false, force, head_sha: SHA, classificationValid: false,
       classificationCheck: false, legitimacyStopped: false, ciGreen: false,
-      secondReviewEligible: false, policyEligible: false, labels: [],
+      secondReviewEligible: false, reviewAtHead: false, policyEligible: false, labels: [],
       protocolRelated: false, risk: "unknown", specialistReviewers: [],
       contributor: { status: force ? "forced" : "unavailable" },
       reason: "valid classification unavailable",
@@ -670,6 +725,210 @@ test("automatic policy ineligibility remains a non-error gate skip", async () =>
   assert.equal(eligible.gate.ok, true);
   assert.equal(eligible.eligible, true);
   assert.deepEqual(eligible.failures, []);
+});
+
+test("the latest exact-head CI generation decides review readiness", async () => {
+  const machineState = {
+    protocolRelated: false, risk: "low", specialistReviewers: [],
+    automaticReviewEligible: true,
+  };
+  const classificationRuns = [{
+    id: 1, external_id: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`, conclusion: "success",
+    app: { slug: "github-actions" },
+    output: {
+      title: "Classification complete",
+      summary: `Validated classification.\n\n${encodeCheckState(machineState)}`,
+    },
+  }];
+  const result = await runReviewGateScript({
+    classificationRuns,
+    workflowRuns: [
+      { id: 1, run_attempt: 1, name: "CI", head_sha: SHA, conclusion: "success" },
+      { id: 2, run_attempt: 1, name: "CI", head_sha: SHA, conclusion: "failure" },
+    ],
+  });
+  assert.equal(result.gate.ciGreen, false);
+  assert.equal(result.gate.ciRunId, 2);
+  assert.equal(result.gate.ciRunAttempt, 1);
+  assert.equal(result.eligible, false);
+});
+
+test("CI generation selection paginates and ignores late older attempts", async () => {
+  const pages = [
+    [{ id: 9, run_attempt: 1, name: "CI", head_sha: SHA, conclusion: "success" }],
+    [
+      { id: 9, run_attempt: 2, name: "CI", head_sha: SHA, conclusion: "in_progress" },
+      { id: 10, run_attempt: 1, name: "CI", head_sha: OTHER_SHA, conclusion: "success" },
+    ],
+  ];
+  assert.equal(latestExactHeadCiRun(pages.flat(), SHA).run_attempt, 2);
+  const github = {
+    paginate: { iterator: async function* () {
+      for (const workflowRuns of pages) yield { data: workflowRuns };
+    } },
+    rest: { actions: { listWorkflowRunsForRepo: () => {} } },
+  };
+  const latest = await readLatestExactHeadCiRun({
+    github, owner: "Devolutions", repo: "IronRDP", expectedSha: SHA, delayMs: 0,
+  });
+  assert.deepEqual({ id: latest.id, attempt: latest.run_attempt, conclusion: latest.conclusion }, {
+    id: 9, attempt: 2, conclusion: "in_progress",
+  });
+});
+
+const ciRun = (changes = {}) => ({
+  id: 5, run_attempt: 1, name: "CI", head_sha: SHA, status: "completed", conclusion: "success", ...changes,
+});
+
+function ciListing(pages) {
+  let polls = 0;
+  const listRuns = () => {};
+  const github = {
+    paginate: { iterator: async function* (method) {
+      assert.equal(method, listRuns);
+      const page = pages[Math.min(polls, pages.length - 1)];
+      polls += 1;
+      yield { data: { workflow_runs: page } };
+    } },
+    rest: { actions: { listWorkflowRunsForRepo: listRuns } },
+  };
+  return { github, polls: () => polls };
+}
+
+test("the triggering CI run is authoritative for its own generation", async () => {
+  const observedRun = ciRun();
+  for (const listed of [[], [ciRun({ status: "in_progress", conclusion: null })]]) {
+    assert.equal(latestExactHeadCiRun(listed, SHA, observedRun), observedRun);
+    const { github, polls } = ciListing([listed]);
+    const latest = await readLatestExactHeadCiRun({
+      github, owner: "Devolutions", repo: "IronRDP", expectedSha: SHA, observedRun, delayMs: 0,
+    });
+    assert.equal(latest, observedRun);
+    assert.equal(polls(), 1);
+  }
+});
+
+test("a newer listed CI generation wins over the triggering run without retry", async () => {
+  const observedRun = ciRun();
+  for (const newer of [
+    ciRun({ run_attempt: 2, status: "in_progress", conclusion: null }),
+    ciRun({ id: 6, status: "queued", conclusion: null }),
+  ]) {
+    const { github, polls } = ciListing([[observedRun, newer]]);
+    let sleeps = 0;
+    const latest = await readLatestExactHeadCiRun({
+      github, owner: "Devolutions", repo: "IronRDP", expectedSha: SHA, observedRun,
+      sleep: async () => { sleeps += 1; },
+    });
+    assert.equal(latest, newer);
+    assert.deepEqual({ polls: polls(), sleeps }, { polls: 1, sleeps: 0 });
+  }
+});
+
+test("the triggering CI run is ignored for another head or workflow", () => {
+  const listed = ciRun({ status: "in_progress", conclusion: null });
+  for (const observedRun of [ciRun({ head_sha: OTHER_SHA }), ciRun({ name: "Fuzz" })]) {
+    assert.equal(latestExactHeadCiRun([listed], SHA, observedRun), listed);
+    assert.equal(latestExactHeadCiRun([], SHA, observedRun), null);
+  }
+});
+
+test("CI listing lag is retried up to its cap", async () => {
+  const lagging = ciRun({ status: "in_progress", conclusion: null });
+  const { github, polls } = ciListing([[], [lagging]]);
+  const delays = [];
+  const latest = await readLatestExactHeadCiRun({
+    github, owner: "Devolutions", repo: "IronRDP", expectedSha: SHA,
+    expectedGeneration: { id: 5, attempt: 1 }, retries: 2, delayMs: 7,
+    sleep: async (ms) => { delays.push(ms); },
+  });
+  assert.equal(latest, lagging);
+  assert.equal(polls(), 3);
+  assert.deepEqual(delays, [7, 7]);
+
+  const settled = ciListing([[ciRun({ id: 4 })], [ciRun()]]);
+  const caughtUp = await readLatestExactHeadCiRun({
+    github: settled.github, owner: "Devolutions", repo: "IronRDP", expectedSha: SHA,
+    expectedGeneration: { id: 5, attempt: 1 }, delayMs: 0,
+  });
+  assert.deepEqual({ id: caughtUp.id, polls: settled.polls() }, { id: 5, polls: 2 });
+
+  // Without a reference generation, an older failed run must not mask a newer run the listing lacks.
+  const masked = ciListing([[ciRun({ id: 4, conclusion: "failure" })], [ciRun({ id: 4, conclusion: "failure" }), ciRun()]]);
+  const unmasked = await readLatestExactHeadCiRun({
+    github: masked.github, owner: "Devolutions", repo: "IronRDP", expectedSha: SHA, delayMs: 0,
+  });
+  assert.deepEqual({ id: unmasked.id, polls: masked.polls() }, { id: 5, polls: 2 });
+  const failed = ciListing([[ciRun({ conclusion: "failure" })]]);
+  await readLatestExactHeadCiRun({
+    github: failed.github, owner: "Devolutions", repo: "IronRDP", expectedSha: SHA, delayMs: 0,
+  });
+  assert.equal(failed.polls(), 4);
+  const referenced = ciListing([[ciRun({ conclusion: "failure" })]]);
+  await readLatestExactHeadCiRun({
+    github: referenced.github, owner: "Devolutions", repo: "IronRDP", expectedSha: SHA,
+    expectedGeneration: { id: 5, attempt: 1 }, delayMs: 0,
+  });
+  assert.equal(referenced.polls(), 1);
+});
+
+test("review gate trusts the completed CI event over a lagging listing", async () => {
+  const machineState = {
+    protocolRelated: false, risk: "low", specialistReviewers: [], automaticReviewEligible: true,
+  };
+  const classificationRuns = [{
+    id: 1, external_id: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`, conclusion: "success",
+    app: { slug: "github-actions" },
+    output: { title: "Classification complete", summary: `ok\n\n${encodeCheckState(machineState)}` },
+  }];
+  const observedRun = ciRun({ id: 36709031420 });
+  for (const workflowRuns of [[], [{ ...observedRun, status: "in_progress", conclusion: null }]]) {
+    const result = await runReviewGateScript({
+      route: "ci", classificationRuns, labels: ["risk/low"], workflowRuns, observedRun,
+    });
+    assert.deepEqual({
+      ciGreen: result.gate.ciGreen, ciSource: result.gate.ciSource, id: result.gate.ciRunId,
+      polls: result.workflowRunPolls,
+    }, { ciGreen: true, ciSource: "event", id: 36709031420, polls: 1 });
+  }
+  const newer = await runReviewGateScript({
+    route: "ci", classificationRuns, labels: ["risk/low"], observedRun,
+    workflowRuns: [{ ...observedRun, run_attempt: 2, status: "in_progress", conclusion: null }],
+  });
+  assert.deepEqual({
+    ciGreen: newer.gate.ciGreen, ciSource: newer.gate.ciSource, attempt: newer.gate.ciRunAttempt,
+    eligible: newer.eligible, polls: newer.workflowRunPolls,
+  }, { ciGreen: false, ciSource: "listing", attempt: 2, eligible: false, polls: 1 });
+});
+
+test("review gate reads paginated check runs and preserves exact ownership", async () => {
+  const machineState = {
+    protocolRelated: false, risk: "low", specialistReviewers: [],
+    automaticReviewEligible: true,
+  };
+  const irrelevant = Array.from({ length: 100 }, (_, id) => ({
+    id, external_id: `other:${id}`, conclusion: "success", app: { slug: "github-actions" },
+  }));
+  const classification = {
+    id: 101, external_id: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`, conclusion: "success",
+    app: { slug: "github-actions" },
+    output: {
+      title: "Classification complete",
+      summary: `Validated classification.\n\n${encodeCheckState(machineState)}`,
+    },
+  };
+  const review = {
+    id: 102, external_id: SHA, conclusion: "success", app: { slug: "github-actions" },
+  };
+  const result = await runReviewGateScript({
+    labels: ["ai-reviewed/1"],
+    classificationRunPages: [irrelevant, [classification]],
+    reviewRunPages: [irrelevant, [review]],
+  });
+  assert.equal(result.gate.classificationValid, true);
+  assert.equal(result.gate.reviewAtHead, true);
+  assert.equal(result.gate.secondReviewEligible, false);
+  assert.equal(result.eligible, false);
 });
 
 test("review outcome requires validated final output", () => {
@@ -850,15 +1109,21 @@ test("review skip summary explains gate and quota failures", () => {
   }), ["The workflow's automated review conditions were not satisfied."]);
 });
 
-test("classification gate reuses completed state but forces oversized retries", async () => {
+test("classification gate reuses paginated completed state but forces oversized retries", async () => {
   let reads = 0;
   const machineState = {
     protocolRelated: false, risk: "low", specialistReviewers: [],
     automaticReviewEligible: true,
   };
-  const github = { rest: { checks: { listForRef: async () => {
-    reads += 1;
-    return { data: { check_runs: [{
+  const listCheckRuns = () => {};
+  const github = {
+    paginate: { iterator: async function* (method) {
+      assert.equal(method, listCheckRuns);
+      reads += 1;
+      yield { data: Array.from({ length: 100 }, (_, id) => ({
+        id, external_id: `other:${id}`, conclusion: "success", app: { slug: "github-actions" },
+      })) };
+      yield { data: [{
       external_id: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`,
       conclusion: "success",
       app: { slug: "github-actions" },
@@ -866,8 +1131,10 @@ test("classification gate reuses completed state but forces oversized retries", 
         title: "Classification complete",
         summary: `Validated classification.\n\n${encodeCheckState(machineState)}`,
       },
-    }] } };
-  } } } };
+      }] };
+    } },
+    rest: { checks: { listForRef: listCheckRuns } },
+  };
   const args = { github, owner: "Devolutions", repo: "IronRDP", expectedSha: SHA };
 
   const cached = await resolveClassificationGate(args);
@@ -885,7 +1152,10 @@ test("classification gate reuses completed state but forces oversized retries", 
 
   const unavailable = await resolveClassificationGate({
     ...args,
-    github: { rest: { checks: { listForRef: async () => { throw new Error("unavailable"); } } } },
+    github: {
+      paginate: { iterator: async function* () { throw new Error("unavailable"); } },
+      rest: { checks: { listForRef: () => {} } },
+    },
   });
   assert.deepEqual(unavailable, {
     available: false,
@@ -1120,7 +1390,7 @@ test("every deterministic label is declared and the repository rules classify to
   ).map((label) => label.name));
   for (const label of [
     ...Object.keys(rules), ...SIZE_LABELS, "contributor/first-time", "kind/protocol", LEGITIMACY_LABEL,
-    OVERLAP_LABEL,
+    OVERLAP_LABEL, ...ACTOR_LABELS, FAILURE_LABEL,
   ]) {
     assert.equal(declaredLabels.has(label), true, `${label} is missing from labels.json`);
   }
@@ -1962,6 +2232,31 @@ test("bot authors are excluded from automation", async () => {
   assert.equal(human.evidenceMaxBytes, 1024 * 1024);
 });
 
+test("only the CI route forwards its triggering run", async () => {
+  const pr = {
+    number: 7, draft: false, state: "open", labels: [],
+    user: { node_id: "U_1", login: "contributor", type: "User" },
+    head: { sha: SHA }, base: { sha: "b".repeat(40) },
+  };
+  const resolve = (eventName, payload) => resolvePr({
+    github: { rest: { pulls: { get: async () => ({ data: pr }) } } },
+    context: { eventName, repo: { owner: "Devolutions", repo: "IronRDP" }, payload },
+    inputs: {},
+  });
+  const ci = await resolve("workflow_run", { workflow_run: {
+    id: 36709031420, run_attempt: 1, name: "CI", head_sha: SHA, status: "completed",
+    conclusion: "success", pull_requests: [{ number: 7 }], head_branch: "topic",
+  } });
+  assert.deepEqual(ci.observedCiRun, {
+    id: 36709031420, run_attempt: 1, head_sha: SHA, name: "CI", status: "completed", conclusion: "success",
+  });
+  const classified = await resolve("repository_dispatch", {
+    action: "pr-automation-classified", client_payload: { pr_number: 7, head_sha: SHA },
+  });
+  assert.equal(classified.ok, true);
+  assert.equal(classified.observedCiRun, null);
+});
+
 test("force is dispatch-only and bypasses draft and bot eligibility", async () => {
   const pullRequest = (changes = {}) => ({
     number: 7, draft: false, state: "open", labels: [],
@@ -2005,6 +2300,30 @@ test("force is dispatch-only and bypasses draft and bot eligibility", async () =
   assert.equal(automaticBot.reason, "bot-authored pull request");
 });
 
+test("pull request events request classification without lifecycle metadata", async () => {
+  const pr = {
+    number: 7, draft: false, state: "open", labels: [],
+    user: { node_id: "U_1", login: "contributor", type: "User" },
+    head: { sha: SHA }, base: { sha: "b".repeat(40) },
+  };
+  const github = {
+    paginate: { iterator: async function* () { yield { data: [pr] }; } },
+    rest: { pulls: { get: async () => ({ data: pr }), list: async () => ({ data: [pr] }) } },
+  };
+  const pullRequestEvent = async (action) => resolvePr({
+    github,
+    context: {
+      eventName: "pull_request_target", repo: { owner: "Devolutions", repo: "IronRDP" },
+      payload: { action, pull_request: { number: 7 } },
+    },
+  });
+  for (const action of ["opened", "reopened", "synchronize", "ready_for_review", "edited"]) {
+    const classification = await pullRequestEvent(action);
+    assert.equal(classification.classificationRequested, true);
+    assert.equal("lifecycleOnly" in classification, false);
+  }
+});
+
 test("only oversized-review label changes start automation from label events", async () => {
   const pullRequest = (labels = []) => ({
     number: 7, draft: false, state: "open", labels,
@@ -2034,6 +2353,8 @@ test("only oversized-review label changes start automation from label events", a
   assert.equal(revoked.reviewRequested, false);
   assert.equal(revoked.evidenceMaxBytes, 1024 * 1024);
   assert.equal((await resolve("breaking-change")).reason, "unrelated pull request label");
+  assert.equal((await resolve("needs-review")).reason, "unrelated pull request label");
+  assert.equal((await resolve(FAILURE_LABEL)).reason, "unrelated pull request label");
   assert.equal((await resolve("size/XXL")).reason, "unrelated pull request label");
   assert.equal((await resolve("size/XXL", "unlabeled", [])).reason, "unrelated pull request label");
 });
@@ -2059,8 +2380,9 @@ test("deterministic semver outranks the model and a model-only break cannot stay
     semver: { head_sha: SHA, status: "unavailable" },
   });
   assert.equal(unavailable.failed, true);
-  assert.deepEqual(unavailable.addLabels, ["maintainer-required"]);
-  assert.deepEqual(unavailable.labelSets.at(-1).desired, ["risk/unknown"]);
+  assert.deepEqual(desiredLabels(unavailable, "needs-review"), []);
+  assert.deepEqual(desiredLabels(unavailable, FAILURE_LABEL), [FAILURE_LABEL]);
+  assert.deepEqual(desiredLabels(unavailable, "risk/unknown"), ["risk/unknown"]);
   assert.equal(unavailable.check.title, "Classification unavailable");
   assert.equal(unavailable.check.conclusion, "neutral");
   assert.match(unavailable.check.summary, /public API compatibility unavailable/);
@@ -2157,24 +2479,26 @@ test("successful classification preserves the first-time contributor label", () 
     ["contributor/first-time"]);
 });
 
-test("same-head reclassification preserves an existing maintainer handoff", () => {
+test("successful normal classification clears state while forced classification preserves it", () => {
   const deterministic = {
     ok: true, pathLabels: [], ownedPathLabels: [], sizeLabel: "size/S",
     sizeLabels: ["size/S"], firstTime: false,
   };
-  const classify = (completed) => resolveClassificationState({
+  const classify = (force = false) => resolveClassificationState({
     expectedSha: SHA,
-    labels: ["maintainer-required"],
+    labels: [...ACTOR_LABELS, FAILURE_LABEL],
     deterministic,
     classifier: classifier(),
-    classificationGate: { available: true, completed },
     semver: { head_sha: SHA, status: "not-suspected" },
+    force,
   });
 
-  assert.deepEqual(classify(true).addLabels, ["maintainer-required"]);
-  assert.deepEqual(classify(true).removeLabels, []);
-  assert.deepEqual(classify(false).addLabels, []);
-  assert.deepEqual(classify(false).removeLabels, ["maintainer-required"]);
+  assert.deepEqual(desiredLabels(classify(), "needs-review"), []);
+  assert.deepEqual(desiredLabels(classify(), FAILURE_LABEL), []);
+  // Contradictory actor state fails closed instead of preserving both labels.
+  assert.deepEqual(desiredLabels(classify(true), "needs-review"), []);
+  assert.deepEqual(desiredLabels(classify(true), FAILURE_LABEL), [FAILURE_LABEL]);
+  assert.equal(classify(true).dispatchReview, false);
 });
 
 test("terminal review count stops only the review pipeline", () => {
@@ -2198,9 +2522,9 @@ test("terminal review count stops only the review pipeline", () => {
   assert.equal(state.check.title, "Classification complete");
   assert.deepEqual(state.labelSets.find((set) => set.owned.includes("risk/unknown")).desired,
     ["risk/medium"]);
-  assert.deepEqual(state.addLabels, ["maintainer-required"]);
-  assert.deepEqual(state.removeLabels, []);
-  assert.equal(state.dispatchReview, false);
+  assert.deepEqual(desiredLabels(state, "needs-review"), []);
+  assert.deepEqual(desiredLabels(state, FAILURE_LABEL), []);
+  assert.equal(state.dispatchReview, true);
   assert.equal(reviewPolicyEligible({ labels: ["ai-reviewed/2", "risk/medium"] }), false);
 });
 
@@ -2281,7 +2605,7 @@ test("size/XXL remains informational and does not suppress classification", () =
   assert.deepEqual(desired.sort(), ["breaking-change", "contributor/first-time", "risk/high",
     "scope/core", "scope/web", "size/XXL"]);
   assert.deepEqual(state.addLabels, []);
-  assert.deepEqual(state.removeLabels, ["maintainer-required"]);
+  assert.deepEqual(desiredLabels(state, "needs-review"), []);
   assert.deepEqual(state.comments, []);
   assert.equal(state.check.title, "Classification complete");
   assert.equal(state.check.machineState.automaticReviewEligible, true);
@@ -2305,7 +2629,7 @@ test("suspected overlap is advisory and is withdrawn once it no longer holds", (
   const flagged = state(true);
   // Overlap alone neither hands the pull request to a maintainer nor stops the review dispatch.
   assert.deepEqual(flagged.addLabels, []);
-  assert.deepEqual(flagged.removeLabels, ["maintainer-required"]);
+  assert.deepEqual(desiredLabels(flagged, "needs-review"), []);
   assert.equal(flagged.dispatchReview, true);
   assert.deepEqual(flagged.labelSets.find((set) => set.owned.includes(OVERLAP_LABEL)).desired,
     [OVERLAP_LABEL]);
@@ -2350,9 +2674,11 @@ test("legitimacy flags leave SHA-bound audit records for maintainer triage", () 
   assert.deepEqual(stopped.comments, []);
   assert.equal(stopped.auditComments[0].kind, "legitimacy");
   assert.equal(stopped.auditComments[0].marker, `${LEGITIMACY_MARKER_PREFIX}${SHA} -->`);
-  assert.deepEqual(stopped.addLabels, ["maintainer-required", LEGITIMACY_LABEL]);
+  assert.deepEqual(stopped.addLabels, [LEGITIMACY_LABEL]);
+  assert.deepEqual(desiredLabels(stopped, "needs-review"), []);
   assert.match(markerBody(stopped.auditComments[0]), new RegExp(SHA));
   assert.match(markerBody(stopped.auditComments[0]), /remains as an audit record/);
+  assert.match(markerBody(stopped.auditComments[0]), /When CI succeeds for this exact head/);
 
   const laterStopped = resolveClassificationState({
     expectedSha: OTHER_SHA, labels: [LEGITIMACY_LABEL], deterministic,
@@ -2377,7 +2703,7 @@ test("legitimacy flags leave SHA-bound audit records for maintainer triage", () 
   assert.equal(cleared.labelSets.some((set) => set.owned.includes(LEGITIMACY_LABEL)), false);
 });
 
-test("global quota decisions stop classification and review with a bounded human handoff", () => {
+test("quota failures mark classification while an unattempted review stays blocked", () => {
   const deterministic = { ok: true, pathLabels: [], ownedPathLabels: [], sizeLabel: "size/S", sizeLabels: ["size/S"],
     firstTime: false };
   const classification = resolveClassificationState({
@@ -2387,15 +2713,19 @@ test("global quota decisions stop classification and review with a bounded human
   });
   assert.equal(classification.failed, true);
   assert.equal(classification.comments[0].kind, "global-quota");
+  assert.deepEqual(desiredLabels(classification, FAILURE_LABEL), [FAILURE_LABEL]);
+  assert.match(markerBody(classification.comments[0], "Devolutions", "IronRDP"),
+    /Automation remains blocked until capacity is available/);
 
   const review = resolveReviewState({
     expectedSha: SHA, labels: ["risk/high"],
-    gate: { ok: true, head_sha: SHA, classificationCheck: true, ciGreen: true },
+    gate: { ok: true, head_sha: SHA, classificationValid: true, classificationCheck: true, ciGreen: true,
+      risk: "high", protocolRelated: false, specialistReviewers: ["skeptical"] },
     contributor: { status: "eligible" },
     rateLimit: { status: "limited", scope: "global", quota: 50, count: 51 },
   });
-  assert.equal(review.failed, true);
-  assert.equal(review.comments[0].kind, "global-quota");
+  assert.equal(review.failed, undefined);
+  assert.deepEqual(desiredLabels(review, "needs-review"), []);
 });
 
 test("forced classification bypasses policy, quota, and cache but still validates output", () => {
@@ -2405,7 +2735,7 @@ test("forced classification bypasses policy, quota, and cache but still validate
   };
   const args = {
     expectedSha: SHA,
-    labels: [],
+    labels: ["needs-author-action", FAILURE_LABEL],
     deterministic,
     classifier: classifier(),
     classificationGate: { available: false, reason: "checks unavailable" },
@@ -2415,15 +2745,19 @@ test("forced classification bypasses policy, quota, and cache but still validate
   };
   const state = resolveClassificationState(args);
   assert.equal(state.failed, undefined);
+  assert.equal(state.forced, true);
   assert.equal(state.oversized, undefined);
   assert.equal(state.check.title, "Classification complete");
   assert.equal(state.dispatchReview, false);
   assert.equal(state.check.machineState.automaticReviewEligible, false);
+  assert.deepEqual(desiredLabels(state, "needs-author-action"), ["needs-author-action"]);
+  assert.deepEqual(desiredLabels(state, FAILURE_LABEL), [FAILURE_LABEL]);
   assert.equal(state.comments.some((comment) => comment.kind === "oversized"), false);
   assert.equal(state.removeCommentMarkers.includes(OVERSIZED_MARKER), true);
 
   const invalid = resolveClassificationState({ ...args, classifier: "" });
   assert.equal(invalid.failed, true);
+  assert.equal(invalid.forced, true);
   assert.equal(invalid.reason, "invalid classifier object");
   assert.deepEqual(invalid.comments, []);
   const wrongHead = resolveClassificationState({
@@ -2449,6 +2783,7 @@ test("forced review bypasses eligibility while retaining publication gates", () 
   };
   const state = resolveReviewState(args);
   assert.equal(state.failed, undefined);
+  assert.equal(state.forced, true);
   assert.deepEqual(state.labelSets[0].desired, ["ai-reviewed/2"]);
   const findingState = resolveReviewState({
     ...args, reviewer: review(),
@@ -2482,16 +2817,19 @@ test("review transition is terminal-safe and preserves human triage on no findin
     }, contributor: { status: "eligible" },
   });
   assert.deepEqual(state.labelSets[0].desired, ["ai-reviewed/1"]);
-  assert.deepEqual(state.addLabels, ["maintainer-required"]);
+  assert.deepEqual(desiredLabels(state, "needs-review"), ["needs-review"]);
+  assert.deepEqual(desiredLabels(state, FAILURE_LABEL), []);
   assert.equal(state.comments.length, 1);
   assert.deepEqual(state.comments[0].review, reviewer);
-  assert.equal(resolveReviewState({
+  const terminal = resolveReviewState({
     expectedSha: SHA, labels: ["ai-reviewed/2"], reviewer,
     gate: {
-      ok: true, head_sha: SHA, classificationCheck: true, ciGreen: true,
+      ok: false, head_sha: SHA, classificationValid: true, classificationCheck: true, ciGreen: true,
       risk: "high", protocolRelated: false, specialistReviewers: ["skeptical"],
     }, contributor: { status: "eligible" },
-  }).failed, true);
+  });
+  assert.equal(terminal.comments.length, 0);
+  assert.deepEqual(desiredLabels(terminal, "needs-review"), ["needs-review"]);
 });
 
 test("a review with findings leaves the next step with the contributor", () => {
@@ -2501,14 +2839,14 @@ test("a review with findings leaves the next step with the contributor", () => {
     secondReviewEligible: true,
   };
   const second = resolveReviewState({
-    expectedSha: SHA, labels: ["ai-reviewed/1", "risk/high", "maintainer-required"],
+    expectedSha: SHA, labels: ["ai-reviewed/1", "risk/high", "needs-review"],
     reviewer: review(), gate, contributor: { status: "eligible" },
   });
   assert.deepEqual(second.labelSets[0].desired, ["ai-reviewed/2"]);
-  assert.deepEqual(second.addLabels, []);
-  assert.deepEqual(second.removeLabels, ["maintainer-required"]);
+  assert.deepEqual(desiredLabels(second, "needs-author-action"), ["needs-author-action"]);
+  assert.deepEqual(desiredLabels(second, FAILURE_LABEL), []);
 
-  // Automatic review is exhausted at `ai-reviewed/2`, so classification owns the later handoff.
+  // Classification clears stale actor labels before the lightweight review route resolves the handoff.
   const nextPush = resolveClassificationState({
     expectedSha: OTHER_SHA,
     labels: ["ai-reviewed/2", "risk/high"],
@@ -2519,8 +2857,7 @@ test("a review with findings leaves the next step with the contributor", () => {
     classifier: classifier({ head_sha: OTHER_SHA }),
     semver: { head_sha: OTHER_SHA, status: "not-suspected" },
   });
-  assert.deepEqual(nextPush.addLabels, ["maintainer-required"]);
-  assert.deepEqual(nextPush.removeLabels, []);
+  assert.deepEqual(desiredLabels(nextPush, "needs-review"), []);
 });
 
 test("review blockers distinguish gate and contributor history failures", () => {
@@ -2536,52 +2873,53 @@ test("review blockers distinguish gate and contributor history failures", () => 
     ...args, gate: { ...args.gate, ok: false, reason: "checks unavailable" },
   });
   assert.equal(invalidGate.ok, true);
-  assert.equal(invalidGate.failed, true);
+  assert.equal(invalidGate.failed, undefined);
   assert.equal(invalidGate.reason, "review gate unavailable: checks unavailable");
 
   const ineligible = resolveReviewState({
     ...args, contributor: { status: "bot" },
   });
   assert.equal(ineligible.ok, true);
-  assert.equal(ineligible.failed, true);
+  assert.equal(ineligible.failed, undefined);
   assert.equal(ineligible.reason, "author is a bot account");
+  assert.equal(ineligible.blocked, true);
   assert.deepEqual(ineligible.labelSets, []);
-  assert.deepEqual(ineligible.addLabels, ["maintainer-required"]);
   assert.deepEqual(ineligible.comments, []);
 
   const unavailable = resolveReviewState({
     ...args, contributor: { status: "unavailable", reason: "GitHub API unavailable" },
   });
   assert.equal(unavailable.ok, true);
-  assert.equal(unavailable.failed, true);
+  assert.equal(unavailable.failed, undefined);
   assert.equal(unavailable.reason, "contributor eligibility unavailable: GitHub API unavailable");
 
   const ciPending = resolveReviewState({
     ...args, gate: { ...args.gate, ok: false, ciGreen: false },
   });
   assert.equal(ciPending.reason, "CI has not succeeded");
-  assert.deepEqual(ciPending.addLabels, []);
-  assert.deepEqual(ciPending.removeLabels, ["maintainer-required"]);
+  assert.deepEqual(desiredLabels(ciPending, "needs-review"), []);
 
   for (const labels of [
     ["ai-reviewed/1", "risk/high"],
-    ["ai-reviewed/1", "risk/high", "maintainer-required"],
+    ["ai-reviewed/1", "risk/high", "needs-review"],
   ]) {
     const secondReview = resolveReviewState({
       ...args, labels,
       gate: { ...args.gate, ok: false, ciGreen: false, secondReviewEligible: false },
     });
-    assert.equal(secondReview.reason, "second review is not eligible");
-    assert.deepEqual(secondReview.addLabels, []);
-    assert.deepEqual(secondReview.removeLabels, []);
+    assert.equal(secondReview.reason, "CI has not succeeded");
+    assert.deepEqual(desiredLabels(secondReview, "needs-review"), []);
   }
 
   const policy = resolveReviewState({
     ...args, labels: ["risk/low", LEGITIMACY_LABEL],
-    gate: { ...args.gate, policyEligible: false, protocolRelated: false },
+    gate: {
+      ...args.gate, ok: false, classificationValid: true, policyEligible: false,
+      protocolRelated: false, legitimacyStopped: true,
+    },
   });
-  assert.equal(policy.reason, "review is not eligible");
-  assert.deepEqual(policy.addLabels, ["maintainer-required"]);
+  assert.equal(policy.reason, "review is handed to a human");
+  assert.deepEqual(desiredLabels(policy, "needs-review"), ["needs-review"]);
 
   // Overlap is advisory at publication too, so the review this run spent its model call on is
   // published instead of being discarded.
@@ -2606,8 +2944,8 @@ test("an unavailable mandatory protocol specialist blocks the review count", () 
   });
   assert.equal(failed.failed, true);
   assert.equal(failed.reason, "protocol specialist unavailable");
-  assert.deepEqual(failed.addLabels, ["maintainer-required"]);
-  assert.deepEqual(failed.labelSets, []);
+  assert.deepEqual(desiredLabels(failed, "needs-review"), []);
+  assert.deepEqual(desiredLabels(failed, FAILURE_LABEL), [FAILURE_LABEL]);
   assert.equal(failed.check.conclusion, "neutral");
   assert.match(failed.check.summary, /protocol specialist unavailable/);
   assert.deepEqual(resolveReviewState(args).labelSets[0].desired, ["ai-reviewed/1"]);
@@ -2632,9 +2970,29 @@ test("evidence failures are reported only for an eligible review", () => {
   assert.equal(active.reason, "changed file retrieval unavailable");
   assert.equal(active.check.conclusion, "neutral");
 
-  const terminal = resolveReviewState({ ...args, labels: ["ai-reviewed/2", "risk/high"] });
-  assert.equal(terminal.reason, "terminal AI review count");
+  const terminal = resolveReviewState({
+    ...args,
+    labels: ["ai-reviewed/2", "risk/high"],
+    gate: { ...args.gate, ok: false, classificationValid: true },
+  });
+  assert.equal(terminal.reason, "review is handed to a human");
   assert.equal(terminal.check, undefined);
+  assert.deepEqual(desiredLabels(terminal, "needs-review"), ["needs-review"]);
+});
+
+test("a same-head duplicate review preserves current actor and failure labels", () => {
+  const duplicate = resolveReviewState({
+    expectedSha: SHA, labels: ["risk/high", "needs-author-action", FAILURE_LABEL],
+    gate: {
+      ok: false, head_sha: SHA, classificationCheck: true, ciGreen: true,
+      reviewAtHead: true, risk: "high", protocolRelated: false, specialistReviewers: ["skeptical"],
+    },
+    contributor: { status: "eligible" },
+    reviewAttempted: false,
+  });
+  assert.equal(duplicate.failed, undefined);
+  assert.equal(duplicate.blocked, true);
+  assert.deepEqual(duplicate.labelSets, []);
 });
 
 test("writer stops before mutations when the head is stale", async () => {
@@ -2645,7 +3003,7 @@ test("writer stops before mutations when the head is stale", async () => {
   } };
   await assert.rejects(writeState({
     github, owner: "Devolutions", repo: "IronRDP", prNumber: 1, botLogin: "github-actions[bot]",
-    state: { ok: true, mode: "classification", expectedSha: SHA, labelSets: [], addLabels: ["maintainer-required"] },
+    state: { ok: true, mode: "classification", expectedSha: SHA, labelSets: [], addLabels: ["needs-review"] },
   }), StaleHeadError);
   assert.equal(writes, 0);
 });
@@ -2653,7 +3011,13 @@ test("writer stops before mutations when the head is stale", async () => {
 test("writer stops before mutations when review policy or count changes", async () => {
   let writes = 0;
   let labels = [{ name: LEGITIMACY_LABEL }];
-  const github = { rest: {
+  const listRuns = () => {};
+  const github = { paginate: { iterator: async function* (method) {
+    if (method === listRuns) yield { data: [{
+      id: 1, run_attempt: 1, name: "CI", head_sha: SHA, conclusion: "success",
+    }] };
+  } }, rest: {
+    actions: { listWorkflowRunsForRepo: listRuns },
     pulls: { get: async () => ({ data: { state: "open", head: { sha: SHA } } }) },
     issues: {
       get: async () => ({ data: { labels } }),
@@ -2665,6 +3029,7 @@ test("writer stops before mutations when review policy or count changes", async 
     state: {
       ok: true, mode: "review", expectedSha: SHA,
       expectedReviewCount: null, forced: false, protocolRelated: false,
+      ciRunId: 1, ciRunAttempt: 1,
       labelSets: [], addLabels: ["ai-reviewed/1"], comments: [],
     },
   }), StalePolicyError);
@@ -2674,42 +3039,68 @@ test("writer stops before mutations when review policy or count changes", async 
     state: {
       ok: true, mode: "review", expectedSha: SHA,
       expectedReviewCount: null, forced: false, protocolRelated: true,
+      ciRunId: 1, ciRunAttempt: 1,
       labelSets: [], addLabels: ["ai-reviewed/1"], comments: [],
     },
   }), StalePolicyError);
   assert.equal(writes, 0);
 });
 
-test("writer posts no comment for a bot-authored pull request", async () => {
-  const issueComments = [];
-  const github = {
-    paginate: { iterator: async function* () { yield { data: issueComments }; } },
-    rest: {
-      pulls: { get: async () => ({ data: { state: "open", head: { sha: SHA } } }) },
-      issues: {
-        get: async () => ({ data: { labels: ["maintainer-required", "risk/low"] } }),
-        listComments: () => {},
-        createComment: async () => { throw new Error("must not create a comment for a bot author"); },
-        deleteComment: async () => { throw new Error("must not delete a comment for a bot author"); },
-      },
-    },
-  };
+test("bot-authored pull requests preserve the existing labels without a model route", () => {
   const gate = {
     ok: true, head_sha: SHA, classificationCheck: true, ciGreen: true,
     risk: "low", protocolRelated: false, specialistReviewers: ["code-compressor"],
   };
   const state = resolveReviewState({
-    expectedSha: SHA, labels: ["risk/low"], gate,
+    expectedSha: SHA, labels: ["risk/low", "needs-author-action", FAILURE_LABEL], gate,
     contributor: { status: "bot" },
   });
   assert.deepEqual(state.comments, []);
-  assert.deepEqual(state.addLabels, ["maintainer-required"]);
+  assert.equal(state.blocked, true);
+  assert.deepEqual(state.labelSets, []);
+});
 
-  await writeState({
-    github, owner: "Devolutions", repo: "IronRDP", prNumber: 1,
-    botLogin: "github-actions[bot]", state,
+test("terminal handoff publishes only after its stopping policy still holds", async () => {
+  const added = [];
+  const listRuns = () => {};
+  const github = { paginate: { iterator: async function* (method) {
+    if (method === listRuns) {
+      yield { data: [{
+        id: 1, run_attempt: 1, name: "CI", head_sha: SHA, conclusion: "success",
+      }] };
+    } else {
+      yield { data: [] };
+    }
+  } }, rest: {
+    actions: { listWorkflowRunsForRepo: listRuns },
+    pulls: { get: async () => ({ data: { state: "open", head: { sha: SHA } } }) },
+    issues: {
+      get: async () => ({ data: { labels: ["ai-reviewed/2"] } }),
+      addLabels: async ({ labels }) => added.push(...labels),
+    },
+  } };
+  const state = resolveReviewState({
+    expectedSha: SHA, labels: ["ai-reviewed/2"],
+    gate: {
+      ok: false, head_sha: SHA, classificationValid: true, classificationCheck: true,
+      ciGreen: true, ciRunId: 1, ciRunAttempt: 1,
+      risk: "high", protocolRelated: false, specialistReviewers: [],
+    },
+    contributor: { status: "eligible" },
   });
-  assert.deepEqual(issueComments, []);
+  await writeState({
+    github, owner: "Devolutions", repo: "IronRDP", prNumber: 1, state, botLogin: "github-actions[bot]",
+  });
+  assert.deepEqual(added, ["needs-review"]);
+
+  const stale = { ...github, rest: { ...github.rest, issues: {
+    ...github.rest.issues,
+    get: async () => ({ data: { labels: [] } }),
+  } } };
+  await assert.rejects(writeState({
+    github: stale, owner: "Devolutions", repo: "IronRDP", prNumber: 1, state,
+    botLogin: "github-actions[bot]",
+  }), StalePolicyError);
 });
 
 test("writer publishes classification audit comments", async () => {
@@ -2755,13 +3146,70 @@ test("writer batches the label delta and tolerates an absent label removal", asy
   assert.equal(await applyLabels(github, "Devolutions", "IronRDP", 1, {
     expectedSha: SHA,
     labelSets: [{ owned: ["risk/low", "risk/high", "risk/unknown"], desired: ["risk/high"] }],
-    addLabels: ["maintainer-required"], removeLabels: ["obsolete"],
+    addLabels: ["needs-review"], removeLabels: ["obsolete"],
   }), true);
-  assert.deepEqual(added, ["risk/high", "maintainer-required"]);
+  assert.deepEqual(added, ["risk/high", "needs-review"]);
   assert.equal(reads, 1);
   assert.equal(await applyLabels(github, "Devolutions", "IronRDP", 1, {
     expectedSha: SHA, labelSets: [], addLabels: ["risk/low"],
   }), false);
+});
+
+test("actor replacements remove the stale actor before adding its successor", async () => {
+  const calls = [];
+  const labels = new Set(["needs-review", "obsolete"]);
+  const github = { rest: {
+    pulls: { get: async () => ({ data: { state: "open", head: { sha: SHA } } }) },
+    issues: {
+      removeLabel: async ({ name }) => {
+        calls.push(`remove:${name}`);
+        labels.delete(name);
+      },
+      addLabels: async ({ labels: additions }) => {
+        calls.push(`add:${additions.join(",")}`);
+        for (const label of additions) labels.add(label);
+      },
+    },
+  } };
+  await applyLabels(github, "Devolutions", "IronRDP", 1, {
+    expectedSha: SHA,
+    labelSets: [],
+    addLabels: ["needs-author-action", "risk/high"],
+    removeLabels: ["obsolete"],
+  }, labels);
+  assert.deepEqual(calls, [
+    "remove:needs-review",
+    "add:needs-author-action,risk/high",
+    "remove:obsolete",
+  ]);
+  assert.equal(labels.has("needs-review"), false);
+  assert.equal(labels.has("needs-author-action"), true);
+});
+
+test("a failed actor replacement add leaves no actor label", async () => {
+  const calls = [];
+  const labels = new Set(["needs-review"]);
+  const github = { rest: {
+    pulls: { get: async () => ({ data: { state: "open", head: { sha: SHA } } }) },
+    issues: {
+      removeLabel: async ({ name }) => {
+        calls.push(`remove:${name}`);
+        labels.delete(name);
+      },
+      addLabels: async () => {
+        calls.push("add");
+        throw new Error("add failed");
+      },
+    },
+  } };
+  await assert.rejects(applyLabels(github, "Devolutions", "IronRDP", 1, {
+    expectedSha: SHA,
+    labelSets: [],
+    addLabels: ["needs-author-action"],
+  }, labels), /add failed/);
+  assert.deepEqual(calls, ["remove:needs-review", "add"]);
+  assert.equal(labels.has("needs-review"), false);
+  assert.equal(labels.has("needs-author-action"), false);
 });
 
 test("writer reads normalized check-run pages and updates the newest matching run", async () => {
@@ -2770,11 +3218,13 @@ test("writer reads normalized check-run pages and updates the newest matching ru
   const github = {
     paginate: { iterator: async function* () {
       yield { data: [
-        { id: 1, external_id: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`, conclusion: "failure" },
+        { id: 1, external_id: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`, conclusion: "failure",
+          app: { slug: "github-actions" } },
         { id: 4, external_id: "unrelated", conclusion: "failure" },
       ] };
       yield { data: [
-        { id: 3, external_id: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`, conclusion: "failure" },
+        { id: 3, external_id: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`, conclusion: "failure",
+          app: { slug: "github-actions" } },
       ] };
     } },
     rest: {
@@ -2809,13 +3259,14 @@ test("writer reads normalized check-run pages and updates the newest matching ru
   assert.equal(updatedConclusion, "neutral");
 });
 
-test("writer upgrades a neutral automated review check instead of creating a duplicate", async () => {
+test("writer records forced success separately from a neutral automatic check", async () => {
   let created = 0;
   let update = null;
   const github = {
     paginate: { iterator: async function* () {
       yield { data: [{
         id: 7, external_id: SHA, conclusion: "neutral",
+        app: { slug: "github-actions" },
         output: { title: "Automated review unavailable", summary: "Model timed out." },
       }] };
     } },
@@ -2833,19 +3284,17 @@ test("writer upgrades a neutral automated review check instead of creating a dup
     github, owner: "Devolutions", repo: "IronRDP", prNumber: 1, botLogin: "github-actions[bot]",
     state: {
       ok: true, mode: "review", expectedSha: SHA, labelSets: [], addLabels: [], comments: [],
-      expectedReviewCount: null, forced: false, protocolRelated: true,
+      expectedReviewCount: null, forced: true, protocolRelated: true,
       check: { name: "AI automated review", externalId: SHA },
     },
   });
-  assert.equal(created, 0);
-  assert.equal(update.check_run_id, 7);
-  assert.equal(update.conclusion, "success");
-  assert.equal(update.output.title, "Automated review complete");
+  assert.equal(created, 1);
+  assert.equal(update, null);
 });
 
 test("classification dispatch remains edge-triggered except for explicit retries", async () => {
   const writeClassification = async ({
-    dispatchReview = true, existing = "none", reviewRequested = false,
+    dispatchReview = true, existing = "none", reviewRequested = false, title = "Classification complete",
   }) => {
     let creates = 0;
     let updates = 0;
@@ -2860,8 +3309,9 @@ test("classification dispatch remains edge-triggered except for explicit retries
           id: 7,
           external_id: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`,
           conclusion: "success",
+          app: { slug: "github-actions" },
           output: {
-            title: "Classification complete",
+            title,
             summary: existing === "same"
               ? `Validated classification.\n\n${encodeCheckState(machineState)}`
               : "Previous classification state.",
@@ -2886,7 +3336,7 @@ test("classification dispatch remains edge-triggered except for explicit retries
         comments: [], removeCommentMarkers: [], dispatchReview,
         check: {
           name: "AI classification", externalId: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`,
-          title: "Classification complete", summary: "Validated classification.",
+          title, summary: "Validated classification.",
           machineState,
         },
       },
@@ -2898,10 +3348,10 @@ test("classification dispatch remains edge-triggered except for explicit retries
 
   assert.deepEqual(await writeClassification({}), { creates: 1, updates: 0, dispatches: 1 });
   assert.deepEqual(await writeClassification({ existing: "changed" }), {
-    creates: 0, updates: 1, dispatches: 1,
+    creates: 0, updates: 0, dispatches: 0,
   });
   assert.deepEqual(await writeClassification({ existing: "same", reviewRequested: true }), {
-    creates: 0, updates: 0, dispatches: 1,
+    creates: 0, updates: 0, dispatches: 0,
   });
   assert.deepEqual(await writeClassification({ existing: "same" }), {
     creates: 0, updates: 0, dispatches: 0,
@@ -2909,6 +3359,180 @@ test("classification dispatch remains edge-triggered except for explicit retries
   assert.deepEqual(await writeClassification({ dispatchReview: false, reviewRequested: true }), {
     creates: 1, updates: 0, dispatches: 0,
   });
+  assert.deepEqual(await writeClassification({ title: "Automation stopped" }), {
+    creates: 1, updates: 0, dispatches: 1,
+  });
+});
+
+test("green CI completed before legitimacy classification dispatches its handoff", async () => {
+  const machineState = {
+    protocolRelated: false, risk: "low", specialistReviewers: [],
+    automaticReviewEligible: true,
+  };
+  const classificationRuns = [{
+    id: 1, external_id: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`, conclusion: "success",
+    app: { slug: "github-actions" },
+    output: {
+      title: "Automation stopped",
+      summary: `Validated classification.\n\n${encodeCheckState(machineState)}`,
+    },
+  }];
+  const { gate } = await runReviewGateScript({
+    route: "classification-complete",
+    classificationRuns,
+    workflowRuns: [{ id: 7, run_attempt: 1, name: "CI", head_sha: SHA, conclusion: "success" }],
+  });
+  assert.equal(gate.ciGreen, true);
+  assert.deepEqual({ id: gate.ciRunId, attempt: gate.ciRunAttempt }, { id: 7, attempt: 1 });
+  const state = resolveReviewState({
+    expectedSha: SHA, labels: [LEGITIMACY_LABEL], gate, contributor: { status: "eligible" },
+  });
+  assert.equal(state.handoff, "legitimacy");
+  assert.deepEqual(desiredLabels(state, "needs-review"), ["needs-review"]);
+});
+
+function freshCiWriter(listings) {
+  let polls = 0;
+  let published = 0;
+  const listReviews = () => {};
+  const listChecks = () => {};
+  const listRuns = () => {};
+  const github = {
+    paginate: { iterator: async function* (method) {
+      if (method === listReviews || method === listChecks) yield { data: [] };
+      if (method === listRuns) {
+        yield { data: listings[Math.min(polls, listings.length - 1)] };
+        polls += 1;
+      }
+    } },
+    rest: {
+      actions: { listWorkflowRunsForRepo: listRuns },
+      checks: { listForRef: listChecks, create: async () => {} },
+      pulls: {
+        get: async () => ({ data: { state: "open", head: { sha: SHA } } }),
+        listReviews,
+        createReview: async () => { published += 1; },
+      },
+      issues: {
+        get: async () => ({ data: { labels: [{ name: "risk/low" }] } }),
+        addLabels: async () => {},
+      },
+    },
+  };
+  const state = resolveReviewState({
+    expectedSha: SHA, labels: ["risk/low"], reviewer: review({ findings: [] }),
+    gate: {
+      ok: true, head_sha: SHA, classificationCheck: true, ciGreen: true,
+      ciRunId: 7, ciRunAttempt: 1, risk: "low", protocolRelated: false,
+      specialistReviewers: ["code-compressor"],
+    },
+    contributor: { status: "eligible" },
+  });
+  const write = () => writeState({
+    github, owner: "Devolutions", repo: "IronRDP", prNumber: 1, state, botLogin: "github-actions[bot]",
+    ciRetry: { delayMs: 0 },
+  });
+  return { write, polls: () => polls, published: () => published };
+}
+
+test("writer retries a CI listing that lags behind the authorized generation", async () => {
+  const authorized = ciRun({ id: 7 });
+  const writer = freshCiWriter([[{ ...authorized, status: "in_progress", conclusion: null }], [authorized]]);
+  await writer.write();
+  assert.equal(writer.published(), 1);
+  // One lagging poll, then one poll for each freshness check once the listing has caught up.
+  assert.equal(writer.polls(), 4);
+});
+
+test("writer rejects a newer CI generation without retry", async () => {
+  const writer = freshCiWriter([[ciRun({ id: 7 }), ciRun({ id: 7, run_attempt: 2 })]]);
+  await assert.rejects(writer.write(), StalePolicyError);
+  assert.deepEqual({ polls: writer.polls(), published: writer.published() }, { polls: 1, published: 0 });
+});
+
+test("writer blocks a review when a newer exact-head CI attempt starts", async () => {
+  let published = 0;
+  let checks = 0;
+  let labels = 0;
+  const listReviews = () => {};
+  const listChecks = () => {};
+  const listRuns = () => {};
+  const github = {
+    paginate: { iterator: async function* (method) {
+      if (method === listReviews || method === listChecks) yield { data: [] };
+      if (method === listRuns) yield { data: [{
+        id: 7, run_attempt: 2, name: "CI", head_sha: SHA, conclusion: null, status: "in_progress",
+      }] };
+    } },
+    rest: {
+      actions: { listWorkflowRunsForRepo: listRuns },
+      checks: { listForRef: listChecks, create: async () => { checks += 1; } },
+      pulls: {
+        get: async () => ({ data: { state: "open", head: { sha: SHA } } }),
+        listReviews,
+        createReview: async () => { published += 1; },
+      },
+      issues: {
+        get: async () => ({ data: { labels: [{ name: "risk/low" }] } }),
+        addLabels: async () => { labels += 1; },
+      },
+    },
+  };
+  const state = resolveReviewState({
+    expectedSha: SHA, labels: ["risk/low"], reviewer: review({ findings: [] }),
+    gate: {
+      ok: true, head_sha: SHA, classificationCheck: true, ciGreen: true,
+      ciRunId: 7, ciRunAttempt: 1, risk: "low", protocolRelated: false,
+      specialistReviewers: ["code-compressor"],
+    },
+    contributor: { status: "eligible" },
+  });
+  await assert.rejects(writeState({
+    github, owner: "Devolutions", repo: "IronRDP", prNumber: 1, state, botLogin: "github-actions[bot]",
+  }), StalePolicyError);
+  assert.deepEqual({ published, checks, labels }, { published: 0, checks: 0, labels: 0 });
+});
+
+test("writer applies blocked reconciliation without review-policy assertions", async () => {
+  const baseGate = {
+    ok: true, head_sha: SHA, classificationCheck: true, ciGreen: true,
+    ciRunId: 7, ciRunAttempt: 1, risk: "low", protocolRelated: false,
+    specialistReviewers: ["code-compressor"],
+  };
+  const states = [
+    resolveReviewState({
+      expectedSha: SHA, labels: ["risk/low", "needs-review", FAILURE_LABEL],
+      gate: { ...baseGate, ciGreen: false }, contributor: { status: "eligible" },
+    }),
+    resolveReviewState({
+      expectedSha: SHA, labels: ["risk/low", "needs-author-action", FAILURE_LABEL],
+      gate: baseGate, contributor: { status: "eligible" }, rateLimit: { status: "limited" },
+    }),
+    resolveReviewState({
+      expectedSha: SHA, labels: ["risk/low", "needs-author-action", FAILURE_LABEL],
+      gate: { ...baseGate, reviewAtHead: true }, contributor: { status: "eligible" },
+    }),
+  ];
+  for (const state of states) {
+    const removed = [];
+    const github = { paginate: { iterator: async function* () { yield { data: [] }; } }, rest: {
+      pulls: { get: async () => ({ data: { state: "open", head: { sha: SHA } } }) },
+      issues: {
+        get: async () => ({ data: { labels: ["risk/low", "needs-review", "needs-author-action", FAILURE_LABEL] } }),
+        listComments: () => {},
+        removeLabel: async ({ name }) => removed.push(name),
+      },
+    } };
+    assert.equal(state.blocked, true);
+    await writeState({
+      github, owner: "Devolutions", repo: "IronRDP", prNumber: 1, state, botLogin: "github-actions[bot]",
+    });
+    if (state.reason === "an automated review already exists for this head") {
+      assert.deepEqual(removed, []);
+    } else {
+      assert.deepEqual(removed.sort(), ["needs-author-action", "needs-review"]);
+    }
+  }
 });
 
 test("writer retries a truncated current-head read before dispatching once", async () => {
@@ -3018,6 +3642,7 @@ test("writer does not dispatch a completed classification after the head changes
         id: 7,
         external_id: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`,
         conclusion: "success",
+        app: { slug: "github-actions" },
         output: {
           title: "Classification complete",
           summary: `Validated classification.\n\n${encodeCheckState(machineState)}`,
@@ -3035,7 +3660,7 @@ test("writer does not dispatch a completed classification after the head changes
     },
   };
 
-  await assert.rejects(writeState({
+  await writeState({
     github, owner: "Devolutions", repo: "IronRDP", prNumber: 1, botLogin: "github-actions[bot]",
     state: {
       ok: true, mode: "classification", expectedSha: SHA, labelSets: [], addLabels: [],
@@ -3046,7 +3671,7 @@ test("writer does not dispatch a completed classification after the head changes
       },
     },
     reviewRequested: true,
-  }), StaleHeadError);
+  });
   assert.equal(dispatches, 0);
 });
 
@@ -3074,7 +3699,7 @@ test("writer deduplicates one forced review invocation but publishes a later one
       github, owner: "Devolutions", repo: "IronRDP", prNumber: 1, botLogin: "github-actions[bot]",
       state: {
         ok: true, mode: "review", expectedSha: SHA, labelSets: [], addLabels: [],
-        expectedReviewCount: null, forced: false, protocolRelated: true,
+        expectedReviewCount: null, forced: true, protocolRelated: true,
         comments: [{ kind: "review", marker, review: review() }],
       },
     });
@@ -3096,7 +3721,7 @@ test("failed review publication does not consume review count or change triage",
         createReview: async () => { throw new Error("publication failed"); },
       },
       issues: {
-        get: async () => ({ data: { labels: [{ name: "risk/high" }, { name: "maintainer-required" }] } }),
+        get: async () => ({ data: { labels: [{ name: "risk/high" }, { name: "needs-review" }] } }),
         addLabels: async () => { labelWrites += 1; },
         removeLabel: async () => { labelWrites += 1; },
       },
@@ -3106,9 +3731,9 @@ test("failed review publication does not consume review count or change triage",
     github, owner: "Devolutions", repo: "IronRDP", prNumber: 1, botLogin: "github-actions[bot]",
     state: {
       ok: true, mode: "review", expectedSha: SHA,
-      expectedReviewCount: null, forced: false, protocolRelated: false,
+      expectedReviewCount: null, forced: true, protocolRelated: false,
       labelSets: [{ owned: ["ai-reviewed/1", "ai-reviewed/2"], desired: ["ai-reviewed/1"] }],
-      addLabels: [], removeLabels: ["maintainer-required"],
+      addLabels: [], removeLabels: ["needs-review"],
       comments: [{
         kind: "review", marker: `<!-- ironrdp-pr-automation:review:${SHA} -->`,
         review: review(),
@@ -3118,7 +3743,7 @@ test("failed review publication does not consume review count or change triage",
   assert.equal(labelWrites, 0);
 });
 
-test("failed review check persistence does not consume review count", async () => {
+test("a final review check failure may require manual publication repair", async () => {
   let labelWrites = 0;
   const github = {
     paginate: { iterator: async function* () { yield { data: [] }; } },
@@ -3131,7 +3756,7 @@ test("failed review check persistence does not consume review count", async () =
         get: async () => ({ data: { state: "open", head: { sha: SHA } } }),
       },
       issues: {
-        get: async () => ({ data: { labels: [{ name: "risk/high" }, { name: "maintainer-required" }] } }),
+        get: async () => ({ data: { labels: [{ name: "risk/high" }, { name: "needs-review" }] } }),
         addLabels: async () => { labelWrites += 1; },
         removeLabel: async () => { labelWrites += 1; },
       },
@@ -3141,13 +3766,13 @@ test("failed review check persistence does not consume review count", async () =
     github, owner: "Devolutions", repo: "IronRDP", prNumber: 1, botLogin: "github-actions[bot]",
     state: {
       ok: true, mode: "review", expectedSha: SHA,
-      expectedReviewCount: null, forced: false, protocolRelated: false,
+      expectedReviewCount: null, forced: true, protocolRelated: false,
       labelSets: [{ owned: ["ai-reviewed/1", "ai-reviewed/2"], desired: ["ai-reviewed/1"] }],
       addLabels: [], comments: [],
       check: { name: "AI automated review", externalId: SHA },
     },
   }), /check failed/);
-  assert.equal(labelWrites, 0);
+  assert.equal(labelWrites, 1);
 });
 
 test("writer publishes each finding either inline or in the review body", async () => {
@@ -3167,7 +3792,7 @@ test("writer publishes each finding either inline or in the review body", async 
     github, owner: "Devolutions", repo: "IronRDP", prNumber: 1, botLogin: "github-actions[bot]",
     state: {
       ok: true, mode: "review", expectedSha: SHA, labelSets: [], addLabels: [],
-      expectedReviewCount: null, forced: false, protocolRelated: true,
+      expectedReviewCount: null, forced: true, protocolRelated: true,
       comments: [{
         kind: "review",
         marker: `<!-- ironrdp-pr-automation:review:${SHA} -->`,
@@ -3244,7 +3869,7 @@ test("writer rejects tampered publication payloads before calling GitHub", async
   }));
   const state = {
     ok: true, mode: "review", expectedSha: SHA, labelSets: [], addLabels: [],
-    expectedReviewCount: null, forced: false, protocolRelated: false,
+    expectedReviewCount: null, forced: true, protocolRelated: false,
     comments: [{
       kind: "review",
       marker: `<!-- ironrdp-pr-automation:review:${SHA} -->`,
@@ -3298,7 +3923,7 @@ test("writer publishes a green main comment when no findings remain", async () =
     github, owner: "Devolutions", repo: "IronRDP", prNumber: 1, botLogin: "github-actions[bot]",
     state: {
       ok: true, mode: "review", expectedSha: SHA, labelSets: [], addLabels: [],
-      expectedReviewCount: null, forced: false, protocolRelated: false,
+      expectedReviewCount: null, forced: true, protocolRelated: false,
       comments: [{
         kind: "review",
         marker: `<!-- ironrdp-pr-automation:review:${SHA} -->`,
@@ -3328,7 +3953,7 @@ test("writer adds deterministic reduced-coverage notices without filtering findi
     github, owner: "Devolutions", repo: "IronRDP", prNumber: 1, botLogin: "github-actions[bot]",
     state: {
       ok: true, mode: "review", expectedSha: SHA, labelSets: [], addLabels: [],
-      expectedReviewCount: null, forced: false, protocolRelated: false,
+      expectedReviewCount: null, forced: true, protocolRelated: false,
       comments: [{
         kind: "review", marker: `<!-- ironrdp-pr-automation:review:${SHA} -->`,
         reducedCoverage: ["protocol"],
@@ -3366,6 +3991,57 @@ test("review checks name reduced coverage without publishing failure reasons", (
   assert.equal(multiple.checkSummary.split("\n\n")[0],
     "Validated automated review is bound to this commit with reduced coverage: " +
     "optional reviewers skeptical, code-compressor were unavailable.");
+});
+
+test("every rejected output attempt reaches the workflow summary with its full detail", () => {
+  const detail = "invalid specialist candidate dispositions: 9 of 9 candidates have no valid " +
+    "disposition, at aggregate findings skeptical 0, 1, 2, 3 and code-compressor 0, 1, 2, 3, 4";
+  const general = stageOutcome({
+    id: "general", status: "failed", required: true, provider: true,
+    reason: "output remained invalid after the repair limit", category: "output-invalid",
+    rejections: parseDiagnostics(JSON.stringify({
+      outputRejections: [
+        { attempt: 1, activity: "finalizing", layer: "semantic", reason: "short form", detail },
+        { attempt: 2, activity: "repairing", layer: "json", reason: "response was not valid JSON" },
+        { attempt: 3, activity: "repairing", layer: "semantic", reason: "x\u0000y" },
+        "not an attempt",
+      ],
+    })).output_rejections,
+  });
+  // The detail wins over the short reason, and an attempt with nothing usable is dropped.
+  assert.deepEqual(general.rejections, [
+    { attempt: 1, activity: "finalizing", layer: "semantic", reason: detail },
+    { attempt: 2, activity: "repairing", layer: "json", reason: "response was not valid JSON" },
+  ]);
+  // A stage without rejected attempts keeps its earlier shape.
+  assert.equal(Object.hasOwn(stageOutcome({ id: "validate", status: "success" }), "rejections"), false);
+  const bounded = stageOutcome({
+    id: "general", status: "failed",
+    rejections: Array.from({ length: 12 }, (_, index) => ({ attempt: index + 1, reason: "r" })),
+  });
+  assert.equal(bounded.rejections.length, 8);
+
+  const report = buildReport([
+    { id: "evidence", status: "success", required: true },
+    { id: "aggregate", status: "success", required: true },
+    general,
+    { id: "validate", status: "failed", required: true, reason: "general review unavailable" },
+  ]);
+  assert.deepEqual(parseReport(JSON.stringify(report)).stages[2].rejections, general.rejections);
+  const rendered = renderReviewReport({
+    report, outcome: "unavailable", summaryUrl: "https://github.example/actions/runs/123",
+  });
+  assert.match(rendered.workflowSummary, /### Rejected output attempts/);
+  assert.match(rendered.workflowSummary,
+    /\| general \| 1 \| finalizing \| semantic \| .*code-compressor 0, 1, 2, 3, 4 \|/);
+  assert.match(rendered.workflowSummary, /\| general \| 2 \| repairing \| json \| response was not valid JSON \|/);
+  assert.doesNotMatch(rendered.checkSummary, /Rejected output attempts/);
+
+  const clean = renderReviewReport({
+    report: buildReport([{ id: "validate", status: "success" }]), outcome: "complete",
+    summaryUrl: "https://github.example/actions/runs/123",
+  });
+  assert.doesNotMatch(clean.workflowSummary, /Rejected output attempts/);
 });
 
 function paginated(pages) {
@@ -3963,6 +4639,134 @@ test("final review diagnostics report the whole disposition map in one rejection
   assert.match(crowded.reason, /skeptical 0, 1, 2, 3, 4, 5, 6, 7 and 12 more/);
 });
 
+// The runtime turns a rejection it cannot accept into a terminal validator failure, so a detail or
+// guidance it would refuse would cost the stage outright. Run each through the real loader.
+async function assertRuntimeAcceptsRejection(result) {
+  const { loadValidator } = require("../actions/openai-agent/src/validator");
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "review-rejection-"));
+  try {
+    const rejection = {
+      ok: false,
+      reason: result.reason,
+      ...(result.detail === undefined ? {} : { detail: result.detail }),
+      ...(result.guidance === undefined ? {} : { guidance: result.guidance }),
+    };
+    fs.writeFileSync(path.join(directory, "validator.js"),
+      `exports.validate = () => (${JSON.stringify(rejection)});`);
+    const validate = loadValidator(directory, "validator.js#validate", {});
+    assert.deepEqual(await validate({}, { previousCandidate: null, candidates: [], repairAttempt: 0 }),
+      rejection);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+test("final review rejections carry every coordinate and the identifiers still missing", async () => {
+  const limits = require("../actions/openai-agent/src/limits");
+  assert.equal(MAXIMUM_DETAIL_BYTES, limits.MAX_VALIDATION_DETAIL_BYTES);
+  assert.equal(MAXIMUM_GUIDANCE_BYTES, limits.MAX_VALIDATION_GUIDANCE_BYTES);
+
+  // Twenty candidates overflow the short reason's coordinates, never the detail's.
+  const crowded = validateFinalReview(finalOutput([]), finalContext(20));
+  assert.match(crowded.reason, /skeptical 0, 1, 2, 3, 4, 5, 6, 7 and 12 more/);
+  assert.match(crowded.detail, /20 of 20 candidates have no valid disposition, at aggregate findings skeptical 0, 1, 2, .*, 18, 19$/);
+  assert.doesNotMatch(crowded.detail, /more/);
+  assert.equal(crowded.guidance,
+    "Each of these candidates has no candidate_dispositions entry, so add exactly one, as " +
+    "(reviewer, finding_id), copied exactly: " +
+    Array.from({ length: 20 }, (_, index) => `(skeptical, finding-${index + 1})`).join("; "));
+  await assertRuntimeAcceptsRejection(crowded);
+
+  // Only what is still missing is listed, and a reason that already says everything has no detail.
+  const partial = validateFinalReview(finalOutput([disposition(1)]), finalContext());
+  assert.equal(Object.hasOwn(partial, "detail"), false);
+  assert.match(partial.guidance, /\(skeptical, finding-2\); \(skeptical, finding-3\); \(skeptical, finding-4\)$/);
+  assert.doesNotMatch(partial.guidance, /finding-1\)/);
+
+  // A candidate whose only entry has an unusable rationale is corrected, never added again, since
+  // a second entry would be rejected as a duplicate.
+  const unusable = validateFinalReview(finalOutput([
+    disposition(1), disposition(2, { rationale: " " }), disposition(3),
+  ]), finalContext());
+  assert.equal(unusable.guidance,
+    "Each of these candidates has no candidate_dispositions entry, so add exactly one, as " +
+    "(reviewer, finding_id), copied exactly: (skeptical, finding-4). " +
+    "Each of these candidates already has an entry with an unusable rationale, so correct that " +
+    "entry instead of adding another, as (reviewer, finding_id), copied exactly: (skeptical, finding-2)");
+  await assertRuntimeAcceptsRejection(unusable);
+  const onlyUnusable = validateFinalReview(finalOutput([
+    disposition(1), disposition(2, { rationale: " " }), disposition(3), disposition(4),
+  ]), finalContext());
+  assert.match(onlyUnusable.guidance, /^Each of these candidates already has an entry with an unusable rationale/);
+  assert.doesNotMatch(onlyUnusable.guidance, /add exactly one/);
+
+  // Entries that name nothing and no missing candidate leave nothing to quote.
+  const ghost = validateFinalReview(finalOutput([
+    ...[1, 2, 3, 4].map((index) => disposition(index)),
+    disposition(9, { finding_id: "ghost-candidate" }),
+  ]), finalContext());
+  assert.match(ghost.reason, /1 entry naming a candidate the specialists did not report/);
+  assert.equal(Object.hasOwn(ghost, "guidance"), false);
+
+  // An accepted candidate that no finding cites is quoted back the same way.
+  const uncited = validateFinalReview(finalOutput(
+    [1, 2, 3, 4].map((index) => disposition(index, { disposition: index === 3 ? "accepted" : "rejected" })),
+  ), finalContext());
+  assert.match(uncited.reason, /1 accepted or refined candidate is cited by no final finding/);
+  assert.match(uncited.guidance, /exactly one final finding, as \(reviewer, finding_id\), copied exactly: \(skeptical, finding-3\)$/);
+  await assertRuntimeAcceptsRejection(uncited);
+
+  // The saturated review of the other test keeps its full detail within the runtime's allowance.
+  const saturated = validateFinalReview(finalOutput([
+    ...Array.from({ length: 15 }, () => disposition(1, { reviewer: "protocol" })),
+    ...Array.from({ length: 15 }, () => disposition(1)),
+    ...Array.from({ length: 15 }, () => disposition(2, { rationale: " " })),
+    ...Array.from({ length: 15 }, () => disposition(3, { disposition: "ignored" })),
+  ]), finalContext());
+  assert.ok(Buffer.byteLength(saturated.detail, "utf8") <= MAXIMUM_DETAIL_BYTES);
+  assert.match(saturated.detail, /candidate_dispositions index 45, 46, .*, 59$/);
+  await assertRuntimeAcceptsRejection(saturated);
+});
+
+test("the general validator hands detail and guidance to the runtime", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "review-general-"));
+  try {
+    const context = path.join(directory, "context.json");
+    const aggregate = path.join(directory, "aggregate.json");
+    fs.writeFileSync(context, JSON.stringify({
+      changed_paths: ["src/lib.rs"], changed_lines: { "src/lib.rs": [4] },
+    }));
+    fs.writeFileSync(aggregate, JSON.stringify(specialistAggregate(20)));
+    const result = validateGeneral(finalOutput([]), {
+      metadata: {
+        stage: "general", expected_sha: SHA,
+        validation_context_file: context, aggregate_file: aggregate,
+      },
+    });
+    const expected = validateFinalReview(finalOutput([]), finalContext(20));
+    assert.deepEqual(result, {
+      ok: false, reason: expected.reason, detail: expected.detail, guidance: expected.guidance,
+    });
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("the general reviewer prompt lists every candidate identifier and nothing else", () => {
+  const index = candidateIndexPrompt(specialistAggregate(2), SHA);
+  assert.equal(index, [
+    "The validated specialist aggregate reports 2 candidates. Write exactly one " +
+      "`candidate_dispositions` entry for each, copying `reviewer` and `finding_id` exactly:",
+    "- reviewer `skeptical`, finding_id `finding-1`",
+    "- reviewer `skeptical`, finding_id `finding-2`",
+  ].join("\n"));
+  // Specialist prose stays in the file the reviewer reads as untrusted evidence.
+  assert.doesNotMatch(index, new RegExp(candidateFinding().title));
+  assert.match(candidateIndexPrompt({ head_sha: SHA, reviewers: [] }, SHA), /reports no candidates/);
+  assert.equal(candidateIndexPrompt(specialistAggregate(2), OTHER_SHA), "");
+  assert.equal(candidateIndexPrompt(null, SHA), "");
+});
+
 test("final review diagnostics report duplicate and rationale failures independently", () => {
   for (const rationale of [" ", "x\u0000y", "x".repeat(801)]) {
     for (const rationales of [
@@ -4183,6 +4987,7 @@ test("unmeasured provider usage is reported as unknown, never as zero", () => {
   }));
   assert.deepEqual(measured, {
     elapsed_ms: 1200, request_retries: 1, output_repairs: 0, provider_attempts: 2,
+    output_rejections: [],
     tokens: { input: 100, output: 20, total: 120, complete: true },
   });
 
@@ -4190,6 +4995,7 @@ test("unmeasured provider usage is reported as unknown, never as zero", () => {
   for (const raw of ["", "not json", JSON.stringify({}), null]) {
     assert.deepEqual(parseDiagnostics(raw), {
       elapsed_ms: null, request_retries: null, output_repairs: null, provider_attempts: null,
+      output_rejections: [],
       tokens: null,
     });
   }
@@ -4359,7 +5165,7 @@ test("the reusable pipeline stays caller-driven and reports every stage back", (
   assert.doesNotMatch(triggers, /\n {2}(pull_request|push|schedule|workflow_dispatch|issue_comment):/);
 
   for (const input of ["pr-number", "head-sha", "base-sha", "specialist-reviewers",
-    "evidence-max-bytes", "required-reviewers", "gate"]) {
+    "evidence-max-bytes", "required-reviewers", "gate", "lease"]) {
     assert.match(workflow, new RegExp(`\\n {6}${input}:\\n`), `${input} input is missing`);
   }
   for (const removed of ["prior-results", "recovery-attempt", "provenance"]) {
@@ -4368,7 +5174,682 @@ test("the reusable pipeline stays caller-driven and reports every stage back", (
 
   const outputs = workflow.slice(workflow.indexOf("    outputs:"), workflow.indexOf("\npermissions:"));
   assert.deepEqual(outputs.match(/\n {6}[a-z-]+:/g).map((name) => name.trim()),
-    ["failure-reason:"]);
+    ["failure-reason:", "superseded:"]);
+});
+
+test("automatic leases claim once, read complete history, and block an active owner", async () => {
+  const runs = [];
+  const calls = { create: [], list: [] };
+  const github = {
+    paginate: { iterator: async function* (_method, parameters) {
+      calls.list.push(parameters);
+      yield { data: runs };
+    } },
+    rest: {
+      checks: {
+        listForRef: () => {},
+        create: async (payload) => {
+          calls.create.push(payload);
+          const claim = {
+            id: 19, ...payload, app: { slug: "github-actions" }, output: payload.output,
+          };
+          runs.push(claim);
+          return { data: claim };
+        },
+      },
+      actions: {
+        getWorkflowRun: async () => ({ data: { run_attempt: 1, status: "in_progress" } }),
+      },
+    },
+  };
+  const first = await claimAutomaticLease({
+    github, owner: "Devolutions", repo: "IronRDP", kind: "review", headSha: SHA,
+    runId: 7, attempt: 1,
+  });
+  const duplicate = await claimAutomaticLease({
+    github, owner: "Devolutions", repo: "IronRDP", kind: "review", headSha: SHA,
+    runId: 8, attempt: 1,
+  });
+  assert.equal(first.owner, true);
+  assert.equal(duplicate.owner, false);
+  assert.equal(calls.create.length, 1);
+  assert.deepEqual(calls.list[0].filter, "all");
+  assert.deepEqual(calls.create[0], {
+    owner: "Devolutions", repo: "IronRDP", name: "AI automated review",
+    head_sha: SHA, external_id: SHA, status: "in_progress",
+    output: { title: "Automation in progress", summary: leaseMarker(first.lease) },
+  });
+});
+
+test("automatic leases rerun after terminal or missing owners and fail closed on malformed claims", async () => {
+  const marker = leaseMarker({ kind: "classification", headSha: SHA, runId: 7, attempt: 1 });
+  const admit = async ({ status = "completed", missing = false, summary = marker, app = "github-actions" } = {}) => {
+    const creates = [];
+    const github = {
+      paginate: { iterator: async function* () {
+        yield { data: [{
+          id: 5, external_id: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`, status: "in_progress",
+          head_sha: SHA, app: { slug: app }, output: { summary },
+        }] };
+      } },
+      rest: {
+        checks: { listForRef: () => {}, create: async (payload) => {
+          creates.push(payload);
+          return { data: { id: 6 } };
+        } },
+        actions: { getWorkflowRun: async () => {
+          if (missing) {
+            const error = new Error("missing");
+            error.status = 404;
+            throw error;
+          }
+          return { data: { run_attempt: 1, status } };
+        } },
+      },
+    };
+    const result = await claimAutomaticLease({
+      github, owner: "Devolutions", repo: "IronRDP", kind: "classification", headSha: SHA,
+      runId: 8, attempt: 1,
+    });
+    return { result, creates };
+  };
+  assert.equal((await admit({ status: "in_progress" })).result.owner, false);
+  assert.equal((await admit()).result.owner, true);
+  assert.equal((await admit({ missing: true })).result.owner, true);
+  assert.equal((await admit({ summary: "not a lease" })).result.available, false);
+  assert.equal((await admit({
+    summary: leaseMarker({ kind: "classification", headSha: OTHER_SHA, runId: 7, attempt: 1 }),
+  })).result.available, false);
+  assert.equal((await admit({ app: "other-app" })).result.available, false);
+  assert.equal(parseLeaseMarker(leaseMarker({
+    kind: "review", headSha: OTHER_SHA, runId: 3, attempt: 2,
+  })).headSha, OTHER_SHA);
+});
+
+test("explicit success retries can claim while lease API failures stay visible", async () => {
+  const success = {
+    id: 5, external_id: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`, conclusion: "success",
+    head_sha: SHA, app: { slug: "github-actions" },
+  };
+  let creates = 0;
+  const github = {
+    paginate: { iterator: async function* () { yield { data: [success] }; } },
+    rest: {
+      checks: {
+        listForRef: () => {},
+        create: async () => ({ data: { id: ++creates + 5 } }),
+      },
+    },
+  };
+  assert.equal((await claimAutomaticLease({
+    github, owner: "Devolutions", repo: "IronRDP", kind: "classification",
+    headSha: SHA, runId: 7, attempt: 1,
+  })).owner, false);
+  assert.equal((await claimAutomaticLease({
+    github, owner: "Devolutions", repo: "IronRDP", kind: "classification",
+    headSha: SHA, runId: 7, attempt: 1, allowSuccess: true,
+  })).owner, true);
+  assert.equal(creates, 1);
+
+  await assert.rejects(claimAutomaticLease({
+    github: {
+      paginate: { iterator: async function* () { throw new Error("API unavailable"); } },
+      rest: { checks: { listForRef: () => {} } },
+    },
+    owner: "Devolutions", repo: "IronRDP", kind: "classification",
+    headSha: SHA, runId: 7, attempt: 1,
+  }), /API unavailable/);
+});
+
+test("automatic review recheck supersedes changed trusted inputs before general work", async () => {
+  const lease = {
+    kind: "review", headSha: SHA, runId: 7, attempt: 1, checkRunId: 10,
+    marker: leaseMarker({ kind: "review", headSha: SHA, runId: 7, attempt: 1 }),
+  };
+  const recheck = async (changes = {}) => {
+    const listWorkflowRunsForRepo = () => {};
+    const github = {
+      paginate: { iterator: async function* (method, parameters) {
+        if (method === listWorkflowRunsForRepo) {
+          yield { data: [{
+            id: 1, run_attempt: changes.ciAttempt || 1, name: "CI", head_sha: SHA,
+            conclusion: changes.ciConclusion || "success",
+          }] };
+          return;
+        }
+        const review = {
+          id: 10, external_id: SHA, status: "in_progress", conclusion: changes.reviewConclusion,
+          head_sha: SHA, app: { slug: "github-actions" }, output: { summary: lease.marker },
+        };
+        const classification = {
+          id: 9, external_id: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`, conclusion: "success",
+          head_sha: SHA, app: { slug: "github-actions" },
+        };
+        yield { data: parameters.check_name === "AI automated review" ? [review] : [classification] };
+      } },
+      rest: {
+        pulls: { get: async () => {
+          if (changes.readError) throw new Error("API unavailable");
+          return { data: {
+            state: "open", draft: changes.draft === true, head: { sha: changes.head || SHA },
+          } };
+        } },
+        actions: {
+          getWorkflowRun: async () => ({ data: { run_attempt: 1, status: "in_progress" } }),
+          listWorkflowRunsForRepo,
+        },
+        checks: { listForRef: () => {} },
+        issues: { get: async () => ({ data: { labels: (changes.labels || ["risk/low"]).map((name) => ({ name })) } }) },
+      },
+    };
+    return recheckAutomaticReview({
+      github, owner: "Devolutions", repo: "IronRDP", prNumber: 1, headSha: SHA, lease,
+      gate: {
+        classificationId: changes.classificationId ?? 9, ciRunId: 1, ciRunAttempt: 1,
+        labels: ["risk/low"], policyEligible: true, legitimacyStopped: false,
+      },
+    });
+  };
+  assert.equal(await recheck(), true);
+  assert.equal(await recheck({ head: OTHER_SHA }), false);
+  assert.equal(await recheck({ draft: true }), false);
+  assert.equal(await recheck({ ciAttempt: 2 }), false);
+  assert.equal(await recheck({ ciConclusion: "failure" }), false);
+  assert.equal(await recheck({ labels: ["ai-reviewed/1", "risk/low"] }), false);
+  assert.equal(await recheck({ labels: ["triage/legitimacy", "risk/low"] }), false);
+  assert.equal(await recheck({ reviewConclusion: "success" }), false);
+  assert.equal(await recheck({ classificationId: 8 }), false);
+  await assert.rejects(recheck({ readError: true }), /API unavailable/);
+});
+
+test("admission jobs own provider routing and recheck prevents a general call after supersession", () => {
+  const workflow = readWorkflow();
+  const classifier = workflowJob(workflow, "classifier");
+  const classificationAdmission = workflowJob(workflow, "classification-admission");
+  const reviewAdmission = workflowJob(workflow, "review-admission");
+  const pipeline = workflowJob(workflow, "review-pipeline");
+  const reusable = readReviewWorkflow();
+  assert.match(classificationAdmission, /needs: \[resolve-pr, classification-gate\]/);
+  assert.match(classificationAdmission, /actions: read/);
+  assert.match(classificationAdmission, /checks: write/);
+  assert.match(classificationAdmission,
+    /group: pr-automation-admission-classification-\$\{\{ needs\.resolve-pr\.outputs\.pr-number \}\}/);
+  assert.match(classificationAdmission, /cancel-in-progress: false/);
+  assert.match(classificationAdmission, /ALLOW_SUCCESS:/);
+  assert.match(classificationAdmission, /allowSuccess:/);
+  assert.match(classifier, /classification-admission/);
+  assert.match(classifier, /classification-admission\.outputs\.owner == 'true'/);
+  assert.match(reviewAdmission, /needs: \[resolve-pr, review-gate\]/);
+  assert.match(reviewAdmission, /actions: read/);
+  assert.match(reviewAdmission, /checks: write/);
+  assert.match(reviewAdmission,
+    /group: pr-automation-admission-review-\$\{\{ needs\.resolve-pr\.outputs\.pr-number \}\}/);
+  assert.match(reviewAdmission, /cancel-in-progress: false/);
+  assert.match(pipeline, /review-admission\.outputs\.owner == 'true'/);
+  assert.match(pipeline, /lease: \$\{\{ needs\.review-admission\.outputs\.lease \}\}/);
+  assert.match(workflowJob(reusable, "general"), /needs: \[evidence, aggregate, recheck\]/);
+  assert.match(workflowJob(reusable, "general"), /needs\.recheck\.outputs\.allowed == 'true'/);
+  assert.match(workflowJob(reusable, "recheck"), /actions: read/);
+  assert.match(workflowJob(reusable, "recheck"), /checks: read/);
+  assert.match(workflowJob(reusable, "recheck"), /superseded/);
+  assert.match(workflowJob(workflow, "resolve-classification-state"),
+    /classification-gate\.outputs\.available != 'true'/);
+  assert.match(workflowJob(workflow, "resolve-review-state"),
+    /review-gate\.outputs\.eligible != 'true'/);
+});
+
+test("PR #1981 keeps a same-head success when automatic or forced failure arrives", async () => {
+  const mutations = [];
+  const success = {
+    id: 9, external_id: SHA, conclusion: "success",
+    app: { slug: "github-actions" }, output: { title: "Automated review complete", summary: "done" },
+  };
+  const newerFailure = {
+    id: 10, external_id: SHA, conclusion: "neutral",
+    app: { slug: "github-actions" }, output: { title: "Automated review unavailable", summary: "failed" },
+  };
+  const github = {
+    paginate: { iterator: async function* () { yield { data: [success, newerFailure] }; } },
+    rest: {
+      checks: {
+        listForRef: () => {},
+        create: async (payload) => mutations.push(["create", payload]),
+        update: async (payload) => mutations.push(["update", payload]),
+      },
+      pulls: { get: async () => ({ data: { state: "open", head: { sha: SHA } } }) },
+      issues: {
+        get: async () => ({ data: { labels: [{ name: "ai-reviewed/1" }, { name: "needs-review" }] } }),
+        addLabels: async (payload) => mutations.push(["add", payload]),
+        removeLabel: async (payload) => mutations.push(["remove", payload]),
+      },
+    },
+  };
+  for (const forced of [false, true]) {
+    await writeState({
+      github, owner: "Devolutions", repo: "IronRDP", prNumber: 1981,
+      botLogin: "github-actions[bot]",
+      state: {
+        ok: true, mode: "review", expectedSha: SHA, forced, failed: true,
+        labelSets: [{ owned: ["automation-failed"], desired: ["automation-failed"] }],
+        comments: [], check: {
+          name: "AI automated review", externalId: SHA,
+          title: "Automated review unavailable", summary: "failed", conclusion: "neutral",
+        },
+      },
+    });
+  }
+  assert.deepEqual(mutations, []);
+});
+
+test("failed explicit retry neutralizes its lease without downgrading prior success", async () => {
+  const lease = {
+    kind: "classification", headSha: SHA, runId: 7, attempt: 1, checkRunId: 20,
+    marker: leaseMarker({ kind: "classification", headSha: SHA, runId: 7, attempt: 1 }),
+  };
+  const checks = [
+    {
+      id: 19, head_sha: SHA, external_id: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`,
+      status: "completed", conclusion: "success", app: { slug: "github-actions" },
+    },
+    {
+      id: 20, head_sha: SHA, external_id: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`,
+      status: "in_progress", app: { slug: "github-actions" },
+      output: { summary: lease.marker },
+    },
+  ];
+  const updates = [];
+  const github = {
+    paginate: { iterator: async function* () { yield { data: checks }; } },
+    rest: {
+      checks: {
+        listForRef: () => {},
+        update: async (payload) => updates.push(payload),
+      },
+      actions: {
+        getWorkflowRun: async () => ({ data: { run_attempt: 1, status: "in_progress" } }),
+      },
+      pulls: { get: async () => ({ data: { state: "open", head: { sha: SHA } } }) },
+    },
+  };
+  const result = await writeState({
+    github, owner: "Devolutions", repo: "IronRDP", prNumber: 1,
+    state: {
+      ok: true, mode: "classification", expectedSha: SHA, lease, failed: true,
+      labelSets: [{ owned: [FAILURE_LABEL], desired: [FAILURE_LABEL] }],
+      comments: [],
+      check: {
+        name: "AI classification", externalId: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`,
+        title: "Classification unavailable", summary: "failed", conclusion: "neutral",
+        machineState: {
+          protocolRelated: false, risk: "unknown", specialistReviewers: [],
+          automaticReviewEligible: false,
+        },
+      },
+    },
+  });
+  assert.equal(result.superseded, true);
+  assert.deepEqual(updates.map((update) => ({
+    id: update.check_run_id, conclusion: update.conclusion, title: update.output.title,
+  })), [{ id: 20, conclusion: "neutral", title: "Automation superseded" }]);
+});
+
+test("forced failure cannot terminate an active automatic lease", async () => {
+  const marker = leaseMarker({
+    kind: "review", headSha: SHA, runId: 7, attempt: 1,
+  });
+  const mutations = [];
+  const github = {
+    paginate: { iterator: async function* () {
+      yield { data: [{
+        id: 19, external_id: SHA, status: "in_progress",
+        app: { slug: "github-actions" }, output: { summary: marker },
+      }] };
+    } },
+    rest: {
+      checks: {
+        listForRef: () => {},
+        create: async (payload) => mutations.push(["create", payload]),
+        update: async (payload) => mutations.push(["update", payload]),
+      },
+      pulls: { get: async () => ({ data: { state: "open", head: { sha: SHA } } }) },
+      issues: {
+        get: async () => ({ data: { labels: [] } }),
+        addLabels: async (payload) => mutations.push(["add", payload]),
+      },
+    },
+  };
+  const result = await writeState({
+    github, owner: "Devolutions", repo: "IronRDP", prNumber: 1,
+    state: {
+      ok: true, mode: "review", expectedSha: SHA, forced: true, failed: true,
+      labelSets: [{ owned: [FAILURE_LABEL], desired: [FAILURE_LABEL] }],
+      comments: [],
+      check: {
+        name: "AI automated review", externalId: SHA,
+        title: "Automated review unavailable", summary: "failed", conclusion: "neutral",
+      },
+    },
+  });
+  assert.equal(result.superseded, true);
+  assert.deepEqual(mutations, []);
+});
+
+test("a leased review failure mutates labels before completing its neutral check", async () => {
+  const lease = {
+    kind: "review", headSha: SHA, runId: 7, attempt: 1, checkRunId: 19,
+    marker: leaseMarker({ kind: "review", headSha: SHA, runId: 7, attempt: 1 }),
+  };
+  const claim = {
+    id: 19, head_sha: SHA, external_id: SHA, status: "in_progress",
+    app: { slug: "github-actions" }, output: { summary: lease.marker },
+  };
+  const calls = [];
+  const github = {
+    paginate: { iterator: async function* () { yield { data: [claim] }; } },
+    rest: {
+      checks: {
+        listForRef: () => {},
+        update: async (payload) => calls.push(["check", payload.conclusion]),
+      },
+      actions: {
+        getWorkflowRun: async () => ({ data: { run_attempt: 1, status: "in_progress" } }),
+      },
+      pulls: { get: async () => ({ data: { state: "open", head: { sha: SHA } } }) },
+      issues: {
+        get: async () => ({ data: { labels: [{ name: "needs-review" }] } }),
+        removeLabel: async ({ name }) => calls.push(["remove", name]),
+        addLabels: async ({ labels }) => calls.push(["add", labels.join(",")]),
+      },
+    },
+  };
+  await writeState({
+    github, owner: "Devolutions", repo: "IronRDP", prNumber: 1,
+    state: {
+      ok: true, mode: "review", expectedSha: SHA, lease, failed: true,
+      labelSets: [
+        { owned: ["needs-review", "needs-author-action"], desired: [] },
+        { owned: [FAILURE_LABEL], desired: [FAILURE_LABEL] },
+      ],
+      comments: [],
+      check: {
+        name: "AI automated review", externalId: SHA,
+        title: "Automated review unavailable", summary: "failed", conclusion: "neutral",
+      },
+    },
+  });
+  assert.deepEqual(calls, [
+    ["remove", "needs-review"],
+    ["add", FAILURE_LABEL],
+    ["check", "neutral"],
+  ]);
+});
+
+test("a leased blocked review clears actors before completing its claim", async () => {
+  const lease = {
+    kind: "review", headSha: SHA, runId: 7, attempt: 1, checkRunId: 19,
+    marker: leaseMarker({ kind: "review", headSha: SHA, runId: 7, attempt: 1 }),
+  };
+  const claim = {
+    id: 19, head_sha: SHA, external_id: SHA, status: "in_progress",
+    app: { slug: "github-actions" }, output: { summary: lease.marker },
+  };
+  const calls = [];
+  const github = {
+    paginate: { iterator: async function* () { yield { data: [claim] }; } },
+    rest: {
+      checks: {
+        listForRef: () => {},
+        update: async (payload) => calls.push(["check", payload.output.title]),
+      },
+      actions: {
+        getWorkflowRun: async () => ({ data: { run_attempt: 1, status: "in_progress" } }),
+      },
+      pulls: { get: async () => ({ data: { state: "open", head: { sha: SHA } } }) },
+      issues: {
+        get: async () => ({ data: { labels: [{ name: "needs-review" }] } }),
+        removeLabel: async ({ name }) => calls.push(["remove", name]),
+      },
+    },
+  };
+  await writeState({
+    github, owner: "Devolutions", repo: "IronRDP", prNumber: 1,
+    state: {
+      ok: true, mode: "review", expectedSha: SHA, lease, blocked: true,
+      labelSets: [{ owned: ["needs-review", "needs-author-action"], desired: [] }],
+      comments: [],
+    },
+  });
+  assert.deepEqual(calls, [
+    ["remove", "needs-review"],
+    ["check", "Automation blocked"],
+  ]);
+});
+
+test("an automatic writer completes only its current claim and upgrades it to success", async () => {
+  const lease = {
+    kind: "classification", headSha: SHA, runId: 7, attempt: 1, checkRunId: 19,
+    marker: leaseMarker({ kind: "classification", headSha: SHA, runId: 7, attempt: 1 }),
+  };
+  const claim = {
+    id: 19, head_sha: SHA, external_id: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`,
+    status: "in_progress", app: { slug: "github-actions" },
+    output: { title: "Automation in progress", summary: lease.marker },
+  };
+  const priorSuccess = {
+    id: 18, head_sha: SHA, external_id: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`,
+    status: "completed", conclusion: "success", app: { slug: "github-actions" },
+  };
+  let update = null;
+  let dispatches = 0;
+  const github = {
+    paginate: { iterator: async function* () { yield { data: [priorSuccess, claim] }; } },
+    rest: {
+      checks: { listForRef: () => {}, update: async (payload) => { update = payload; } },
+      pulls: { get: async () => ({ data: { state: "open", head: { sha: SHA } } }) },
+      issues: { get: async () => ({ data: { labels: [] } }) },
+      actions: { getWorkflowRun: async () => ({ data: { run_attempt: 1, status: "in_progress" } }) },
+      repos: { createDispatchEvent: async () => { dispatches += 1; } },
+    },
+  };
+  await writeState({
+    github, owner: "Devolutions", repo: "IronRDP", prNumber: 1, botLogin: "github-actions[bot]",
+    state: {
+      ok: true, mode: "classification", expectedSha: SHA, lease, labelSets: [],
+      addLabels: [], comments: [], removeCommentMarkers: [], dispatchReview: true,
+      check: {
+        name: "AI classification", externalId: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`,
+        title: "Classification complete", summary: "Validated classification.",
+        machineState: {
+          protocolRelated: false, risk: "low", specialistReviewers: [],
+          automaticReviewEligible: true,
+        },
+      },
+    },
+  });
+  assert.equal(update.check_run_id, 19);
+  assert.equal(update.status, "completed");
+  assert.equal(update.conclusion, "success");
+  assert.equal("head_sha" in update, false);
+  assert.equal(dispatches, 1);
+});
+
+test("classification dispatch waits for successful claim completion", async () => {
+  const lease = {
+    kind: "classification", headSha: SHA, runId: 7, attempt: 1, checkRunId: 19,
+    marker: leaseMarker({ kind: "classification", headSha: SHA, runId: 7, attempt: 1 }),
+  };
+  const claim = {
+    id: 19, head_sha: SHA, external_id: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`,
+    status: "in_progress", app: { slug: "github-actions" },
+    output: { summary: lease.marker },
+  };
+  let livenessReads = 0;
+  let checkWrites = 0;
+  let dispatches = 0;
+  const github = {
+    paginate: { iterator: async function* () { yield { data: [claim] }; } },
+    rest: {
+      checks: {
+        listForRef: () => {},
+        update: async () => { checkWrites += 1; },
+      },
+      actions: {
+        getWorkflowRun: async () => ({
+          data: {
+            run_attempt: 1,
+            status: ++livenessReads >= 4 ? "completed" : "in_progress",
+          },
+        }),
+      },
+      pulls: { get: async () => ({ data: { state: "open", head: { sha: SHA } } }) },
+      issues: { get: async () => ({ data: { labels: [] } }) },
+      repos: { createDispatchEvent: async () => { dispatches += 1; } },
+    },
+  };
+  const result = await writeState({
+    github, owner: "Devolutions", repo: "IronRDP", prNumber: 1,
+    state: {
+      ok: true, mode: "classification", expectedSha: SHA, lease,
+      labelSets: [], addLabels: [], comments: [], removeCommentMarkers: [],
+      dispatchReview: true,
+      check: {
+        name: "AI classification", externalId: `${CLASSIFIER_SCHEMA_VERSION}:${SHA}`,
+        title: "Classification complete", summary: "Validated classification.",
+        machineState: {
+          protocolRelated: false, risk: "low", specialistReviewers: [],
+          automaticReviewEligible: true,
+        },
+      },
+    },
+  });
+  assert.equal(result.superseded, undefined);
+  assert.equal(checkWrites, 0);
+  assert.equal(dispatches, 0);
+});
+
+test("a forced same-head success still publishes beside an existing canonical success", async () => {
+  let published = null;
+  let checkCreated = false;
+  const github = {
+    paginate: { iterator: async function* (_method, parameters) {
+      if (parameters.check_name) {
+        yield { data: [{
+          id: 9, external_id: SHA, conclusion: "success",
+          app: { slug: "github-actions" }, output: { title: "Automated review complete", summary: "done" },
+        }] };
+      } else yield { data: [] };
+    } },
+    rest: {
+      checks: {
+        listForRef: () => {},
+        create: async () => { checkCreated = true; },
+      },
+      pulls: {
+        get: async () => ({ data: { state: "open", head: { sha: SHA } } }),
+        listReviews: () => {},
+        createReview: async (payload) => { published = payload; },
+      },
+      issues: { get: async () => ({ data: { labels: [] } }) },
+    },
+  };
+  await writeState({
+    github, owner: "Devolutions", repo: "IronRDP", prNumber: 1981, botLogin: "github-actions[bot]",
+    state: {
+      ok: true, mode: "review", expectedSha: SHA, forced: true, expectedReviewCount: null,
+      labelSets: [], comments: [{
+        kind: "review", marker: `<!-- ironrdp-pr-automation:review:${SHA}:force:2 -->`,
+        review: review(),
+      }],
+      check: { name: "AI automated review", externalId: SHA },
+    },
+  });
+  assert.match(published.body, /force:2/);
+  assert.equal(checkCreated, true);
+});
+
+test("forced success neutralizes an overlapping automatic lease before publishing", async () => {
+  const marker = leaseMarker({
+    kind: "review", headSha: SHA, runId: 7, attempt: 1,
+  });
+  const claim = {
+    id: 19, head_sha: SHA, external_id: SHA, status: "in_progress",
+    app: { slug: "github-actions" }, output: { summary: marker },
+  };
+  const olderClaim = {
+    id: 18, head_sha: SHA, external_id: SHA, status: "in_progress",
+    app: { slug: "github-actions" },
+    output: { summary: leaseMarker({
+      kind: "review", headSha: SHA, runId: 6, attempt: 1,
+    }) },
+  };
+  const calls = [];
+  const github = {
+    paginate: { iterator: async function* (_method, parameters) {
+      if (parameters.check_name) yield { data: [olderClaim, claim] };
+      else yield { data: [] };
+    } },
+    rest: {
+      checks: {
+        listForRef: () => {},
+        update: async ({ check_run_id, conclusion }) =>
+          calls.push(["update", check_run_id, conclusion]),
+        create: async ({ conclusion }) => calls.push(["create", conclusion]),
+      },
+      pulls: {
+        get: async () => ({ data: { state: "open", head: { sha: SHA } } }),
+        listReviews: () => {},
+        createReview: async () => calls.push(["review"]),
+      },
+      issues: { get: async () => ({ data: { labels: [] } }) },
+    },
+  };
+  await writeState({
+    github, owner: "Devolutions", repo: "IronRDP", prNumber: 1,
+    botLogin: "github-actions[bot]",
+    state: {
+      ok: true, mode: "review", expectedSha: SHA, forced: true,
+      expectedReviewCount: null, labelSets: [], comments: [{
+        kind: "review", marker: `<!-- ironrdp-pr-automation:review:${SHA}:force:3 -->`,
+        review: review(),
+      }],
+      check: { name: "AI automated review", externalId: SHA },
+    },
+  });
+  assert.deepEqual(calls, [
+    ["update", 18, "neutral"],
+    ["update", 19, "neutral"],
+    ["review"],
+    ["create", "success"],
+  ]);
+});
+
+test("a superseded automatic lease completes neutral without PR publication", async () => {
+  const lease = {
+    kind: "review", headSha: SHA, runId: 7, attempt: 1, checkRunId: 19,
+    marker: leaseMarker({ kind: "review", headSha: SHA, runId: 7, attempt: 1 }),
+  };
+  const claim = {
+    id: 19, head_sha: SHA, external_id: SHA, status: "in_progress",
+    app: { slug: "github-actions" }, output: { summary: lease.marker },
+  };
+  let update = null;
+  const github = {
+    paginate: { iterator: async function* () { yield { data: [claim] }; } },
+    rest: {
+      checks: { listForRef: () => {}, update: async (payload) => { update = payload; } },
+      actions: { getWorkflowRun: async () => ({ data: { run_attempt: 1, status: "in_progress" } }) },
+      pulls: { get: async () => { throw new Error("PR must not be read"); } },
+    },
+  };
+  await writeState({
+    github, owner: "Devolutions", repo: "IronRDP", prNumber: 1,
+    state: { ok: true, mode: "review", expectedSha: SHA, lease, superseded: true },
+  });
+  assert.deepEqual(update, {
+    owner: "Devolutions", repo: "IronRDP", check_run_id: 19, status: "completed",
+    conclusion: "neutral",
+    output: { title: "Automation superseded", summary: lease.marker },
+  });
 });
 
 test("maximum review payloads traverse workflow-controlled files and artifacts", () => {
@@ -4491,6 +5972,18 @@ test("a stage reports provider spending from its own diagnostics", () => {
   const report = workflowJob(scoped, "report");
   assert.match(report, /stageOutcome\(\{ provider: true, \.\.\.recorded \}\)/);
   assert.match(report, /stageOutcome\(\{ provider: true, \.\.\.generalStage \}\)/);
+});
+
+test("model stages report their rejected attempts and the general stage gets the candidate index", () => {
+  const scoped = readReviewWorkflow().slice(readReviewWorkflow().indexOf("\njobs:"));
+  for (const name of ["specialists", "general"]) {
+    assert.match(workflowJob(scoped, name), /rejections: diagnostics\.output_rejections,/, name);
+  }
+  const general = workflowJob(scoped, "general");
+  assert.match(general, /candidateIndexPrompt\(aggregate, process\.env\.HEAD_SHA\)/);
+  assert.match(general, /prompt-context: \$\{\{ steps\.plan\.outputs\.prompt-context \}\}/);
+  assert.ok(general.indexOf("Download specialist aggregate") < general.indexOf("id: plan"),
+    "the index is built from the aggregate this job downloaded");
 });
 
 test("the mandatory reviewer set is resolved once and read everywhere else", () => {
