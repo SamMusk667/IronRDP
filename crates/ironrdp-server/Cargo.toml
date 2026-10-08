@@ -35,6 +35,7 @@ __bench = ["dep:visibility"]
 
 [dependencies]
 rand = "0.9"
+socket2 = { version = "0.6", features = ["all"] }
 tokio = { version = "1", features = ["net", "macros", "sync", "rt", "time"] }
 tokio-rustls = "0.26" # public
 async-trait = "0.1"
@@ -74,6 +75,9 @@ zstd-safe = { version = "7.2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["sync"] }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true

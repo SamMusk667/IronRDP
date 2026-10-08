@@ -4,6 +4,7 @@
 
 pub use ironrdp_connector::sspi;
 
+mod dead_peer;
 mod macros;
 
 pub mod autodetect;

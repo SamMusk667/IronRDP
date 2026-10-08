@@ -437,6 +437,10 @@ pub struct RdpServerOptions {
     /// multitransport is offered. `None` disables the feature entirely. Set
     /// via [`RdpServerBuilder::with_udp_transport`](crate::RdpServerBuilder::with_udp_transport).
     pub udp_bind_addr: Option<SocketAddr>,
+    /// How long a client may stop answering before its connection is
+    /// dropped. `None` (the default) leaves it to the OS defaults. Set via
+    /// [`RdpServerBuilder::with_dead_peer_timeout`](crate::RdpServerBuilder::with_dead_peer_timeout).
+    pub dead_peer_timeout: Option<Duration>,
 }
 
 impl RdpServerOptions {
@@ -2483,6 +2487,8 @@ impl RdpServer {
         // iteration resumes it at finalization, with no second `on_accept`
         // call (that hook is stateful for rate limiters) and no renegotiation.
         let mut pending: Option<(Box<NegotiatedCandidate>, SocketAddr)> = None;
+        // Copied out: the preemption race below holds `self` for the live connection.
+        let dead_peer_timeout = self.opts.dead_peer_timeout;
 
         // Say so out loud: under these modes the bar to evict a live session is
         // NOT authentication, whatever the option's name suggests. Restrict who
@@ -2556,6 +2562,11 @@ impl RdpServer {
                             // connection over, though.
                             if let Err(error) = stream.set_nodelay(true) {
                                 warn!(?peer, %error, "Failed to set TCP_NODELAY; interactive latency may suffer");
+                            }
+                            if let Some(timeout) = dead_peer_timeout
+                                && let Err(error) = crate::dead_peer::drop_after_silence(&stream, timeout)
+                            {
+                                warn!(?peer, %error, "Failed to set up dead peer detection; a vanished client may hold the session");
                             }
                             (stream, peer)
                         },
@@ -2672,6 +2683,16 @@ impl RdpServer {
                                             ?next_peer,
                                             %error,
                                             "Failed to set TCP_NODELAY on a candidate; interactive latency may suffer"
+                                        );
+                                    }
+                                    if let Some(timeout) = dead_peer_timeout
+                                        && let Err(error) =
+                                            crate::dead_peer::drop_after_silence(&next_stream, timeout)
+                                    {
+                                        warn!(
+                                            ?next_peer,
+                                            %error,
+                                            "Failed to set up dead peer detection on a candidate"
                                         );
                                     }
                                     // A peer evicted moments ago may not bounce
@@ -5143,6 +5164,7 @@ mod preempt_tests {
                 remotefx_quant: Quant::default(),
                 remotefx_entropy_coder: None,
                 udp_bind_addr: None,
+                dead_peer_timeout: None,
             },
             creds: None,
             credentials_lookup: None,

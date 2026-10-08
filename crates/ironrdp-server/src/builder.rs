@@ -67,6 +67,7 @@ pub struct BuilderDone {
     remotefx_quant: Quant,
     remotefx_entropy_coder: Option<EntropyBits>,
     udp_bind_addr: Option<SocketAddr>,
+    dead_peer_timeout: Option<core::time::Duration>,
 }
 
 pub struct RdpServerBuilder<State> {
@@ -182,6 +183,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 remotefx_quant: Quant::default(),
                 remotefx_entropy_coder: None,
                 udp_bind_addr: None,
+                dead_peer_timeout: None,
             },
         }
     }
@@ -218,6 +220,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 remotefx_quant: Quant::default(),
                 remotefx_entropy_coder: None,
                 udp_bind_addr: None,
+                dead_peer_timeout: None,
             },
         }
     }
@@ -514,6 +517,23 @@ impl RdpServerBuilder<BuilderDone> {
         self
     }
 
+    /// Drop a connection whose client has stopped answering for about
+    /// `timeout`, so that [`RdpServer::run`] notices a client that vanished
+    /// without closing it (network lost, laptop asleep) and can serve the next
+    /// connection, typically the same client reconnecting with its
+    /// auto-reconnect cookie.
+    ///
+    /// Sets TCP keepalive on each accepted connection, probing over the second
+    /// half of `timeout` while the link is idle, and while data is in flight
+    /// limits how long retransmissions may fail: `TCP_RXT_CONNDROPTIME` on
+    /// Apple platforms, `TCP_USER_TIMEOUT` on Linux. Elsewhere only keepalive
+    /// applies. `None` (the default) leaves the OS defaults, which can keep a
+    /// dead connection for minutes, or hours when it is idle.
+    pub fn with_dead_peer_timeout(mut self, timeout: Option<core::time::Duration>) -> Self {
+        self.state.dead_peer_timeout = timeout;
+        self
+    }
+
     pub fn build(self) -> RdpServer {
         let mut server = RdpServer::new(
             RdpServerOptions {
@@ -526,6 +546,7 @@ impl RdpServerBuilder<BuilderDone> {
                 remotefx_quant: self.state.remotefx_quant,
                 remotefx_entropy_coder: self.state.remotefx_entropy_coder,
                 udp_bind_addr: self.state.udp_bind_addr,
+                dead_peer_timeout: self.state.dead_peer_timeout,
             },
             self.state.handler,
             self.state.display,
